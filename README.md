@@ -1,8 +1,8 @@
 # ESP32-S3 空气质量监测仪
 
-基于 Waveshare ESP32-S3-Touch-LCD-2.8B 的桌面空气监测仪，ESPHome 固件 + 参数化 3D 打印外壳。
+基于 [Waveshare ESP32-S3-Touch-LCD-2.8B](https://docs.waveshare.net/ESP32-S3-Touch-LCD-2.8B/) 的桌面空气监测仪，ESPHome 固件 + 参数化 3D 打印外壳。
 
-![外壳](enclosure/preview/00_overview.png)
+![外壳](enclosure/preview/print_preview.png)
 
 ## 功能
 
@@ -17,6 +17,8 @@
 ESP32-S3R8（16MB Flash / 8MB PSRAM）+ ST7701S 480×640 屏 + GT911 触摸 + SCD41 + QMI8658 + TCA9554。
 
 I2C：SDA 15 / SCL 7。背光：GPIO6。
+
+板子资料、原理图和引脚定义见[微雪官方文档](https://docs.waveshare.net/ESP32-S3-Touch-LCD-2.8B/)。
 
 ## 仓库结构
 
