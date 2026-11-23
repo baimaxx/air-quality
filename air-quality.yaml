@@ -64,6 +64,17 @@ esphome:
       - delay: 8s
       - component.update: scd41
 
+# 本地覆盖的 st7701s 组件。相对内置版改了三处：
+#   1. loop() 不再每轮 restart，避免周期性打断 RGB DMA 导致画面上下跳动
+#   2. bounce buffer 20 行（内置 10 行），减少 PSRAM 读取的碎块
+#   3. 新增 update_pclk_frequency()，供熄屏时降低面板扫描频率
+# 放本地是为了升级 ESPHome 不被覆盖。
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [st7701s]
+
 esp32:
   board: esp32-s3-devkitc-1
   variant: esp32s3
@@ -273,6 +284,8 @@ script:
             - lambda: |-
                 id(g_asleep) = false;
                 id(g_ui_force) = true;
+                // 先把扫描频率和主频拉回来，再恢复渲染和背光，唤醒瞬间才不闪
+                id(lcd)->update_pclk_frequency(12000000);
                 setCpuFrequencyMhz(240);
             - lvgl.resume:
       - light.turn_on:
@@ -303,13 +316,18 @@ script:
                             brightness: 15%
                             transition_length: 2500ms
                   - delay: 500ms
-            - light.turn_off: backlight
-            # 熄屏后的省电三连：CPU 240→80MHz、暂停 LVGL 渲染、界面不再刷新。
-            # RGB 面板仍在扫描静态画面（硬件行为，关不掉），但没有重绘就没有
-            # PSRAM 搬运，这部分是最费电的。
+            - light.turn_off:
+                id: backlight
+                transition_length: 500ms
+            # 等背光真正黑掉再动面板，否则降频瞬间的重启会被看到
+            - delay: 600ms
+            # 熄屏后的省电四连：CPU 240→80MHz、PCLK 12→6MHz、暂停 LVGL 渲染。
+            # 面板扫描是硬件行为停不掉，但 12MHz 时它每秒要从 PSRAM 读 17MB，
+            # 降到 6MHz 减半（8.6MB/s），这部分是熄屏后唯一的持续功耗。
             - lambda: |-
                 id(g_asleep) = true;
                 setCpuFrequencyMhz(80);
+                id(lcd)->update_pclk_frequency(6000000);
             - lvgl.pause:
 
   # 把持久化的设置同步到界面控件（开机 + 每次修改后调用）

@@ -24,6 +24,7 @@ I2C：SDA 15 / SCL 7。背光：GPIO6。
 
 ```
 air-quality.yaml      ESPHome 主配置
+components/st7701s/   本地覆盖的显示组件（熄屏降频等改动）
 secrets.yaml.example  密钥模板
 fonts/               思源黑体（界面字形来源）
 enclosure/           3D 打印外壳（源码 / STEP / STL / 说明）
