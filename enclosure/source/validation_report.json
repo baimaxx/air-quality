@@ -1,0 +1,49 @@
+{
+  "version": "v3.4",
+  "all_pass": true,
+  "order_file_count": 1,
+  "jlc_free_slots_used": 1,
+  "single_connected_order_body": true,
+  "total_volume_cm3": 17.291,
+  "jlc_free_limit_cm3": 70.0,
+  "models": [
+    {
+      "name": "base",
+      "file": "stl/base.stl",
+      "order_file": true,
+      "vertices": 17568,
+      "faces": 35344,
+      "watertight": true,
+      "single_body": true,
+      "body_count": 1,
+      "winding_consistent": true,
+      "degenerate_faces": 0,
+      "volume_cm3": 17.291,
+      "bbox_mm": [
+        56.9,
+        74.8,
+        23.5
+      ],
+      "pass": true
+    },
+    {
+      "name": "slider_standalone_spare",
+      "file": "reference/slider_standalone.stl",
+      "order_file": false,
+      "vertices": 1140,
+      "faces": 2276,
+      "watertight": true,
+      "single_body": true,
+      "body_count": 1,
+      "winding_consistent": true,
+      "degenerate_faces": 0,
+      "volume_cm3": 0.079,
+      "bbox_mm": [
+        4.05,
+        6.65,
+        7.0
+      ],
+      "pass": true
+    }
+  ]
+}

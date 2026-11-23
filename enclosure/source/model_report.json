@@ -1,0 +1,141 @@
+{
+  "version": "v3.4",
+  "parameters": {
+    "outer_w": 56.4,
+    "outer_h": 74.8,
+    "outer_center_y": -2.0,
+    "outer_r": 4.75,
+    "wall": 1.8,
+    "floor": 2.0,
+    "base_bottom": -22.2,
+    "split_z": 1.3,
+    "panel_w": 52.9,
+    "panel_h": 71.3,
+    "panel_center_y": -2.0,
+    "panel_clearance": 0.3,
+    "pocket_r": 3.3,
+    "board_hole_x": 20.45,
+    "board_hole_y_top": 27.35,
+    "board_hole_y_bottom": -32.35,
+    "standoff_bottom_z": -10.0,
+    "boss_od": 5.0,
+    "boss_id": 2.8,
+    "boss_root_d": 6.0,
+    "boss_root_h": 1.0,
+    "boss_gap": 0.2,
+    "screw_clearance_d": 2.8,
+    "screw_head_d": 5.2,
+    "screw_head_depth": 1.0,
+    "battery_max": [
+      28.0,
+      22.0,
+      5.0
+    ],
+    "battery_center": [
+      8.0,
+      8.0
+    ],
+    "sensor_max": [
+      10.0,
+      20.0,
+      10.0
+    ],
+    "sensor_center": [
+      5.0,
+      -25.0
+    ],
+    "vent_recess": [
+      16.0,
+      22.0,
+      0.0
+    ],
+    "vent_cols": 4,
+    "vent_rows": 6,
+    "vent_pitch_x": 3.5,
+    "vent_pitch_y": 3.5,
+    "vent_d": 2.5,
+    "side_vent_ys": [
+      -32.0,
+      -27.0,
+      -22.0,
+      -17.0
+    ],
+    "side_vent_zs": [
+      -18.0,
+      -14.5
+    ],
+    "key_proud": 0.5,
+    "park_center": [
+      4.5,
+      5.0
+    ],
+    "park_gap": 0.6,
+    "sprue_d": 1.6,
+    "sprue_positions": [
+      [
+        2.5,
+        5.5
+      ],
+      [
+        6.5,
+        5.5
+      ]
+    ],
+    "sprue_embed": 0.3
+  },
+  "models": [
+    {
+      "name": "base_printable",
+      "valid_brep": true,
+      "solid_count": 1,
+      "bbox_mm": [
+        56.903,
+        74.804,
+        23.504
+      ],
+      "volume_mm3": 17291.8,
+      "volume_cm3": 17.292
+    },
+    {
+      "name": "base_clean_reference",
+      "valid_brep": true,
+      "solid_count": 1,
+      "bbox_mm": [
+        56.903,
+        74.804,
+        23.504
+      ],
+      "volume_mm3": 17210.62,
+      "volume_cm3": 17.211
+    },
+    {
+      "name": "slider_installed_reference",
+      "valid_brep": true,
+      "solid_count": 1,
+      "bbox_mm": [
+        4.05,
+        6.65,
+        7.001
+      ],
+      "volume_mm3": 78.57,
+      "volume_cm3": 0.079
+    },
+    {
+      "printable_solid_count": 1,
+      "printable_single_connected_body": true,
+      "sprue_count": 2,
+      "sprue_d_mm": 1.6,
+      "parked_slider_bbox_mm": [
+        7.0,
+        6.65,
+        4.05
+      ],
+      "parked_gap_mm": 0.6,
+      "order_files": [
+        "stl/base.stl"
+      ],
+      "jlc_free_slots_used": 1,
+      "combined_volume_cm3": 17.292
+    }
+  ]
+}
