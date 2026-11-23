@@ -573,7 +573,8 @@ font:
     size: 24
     bpp: 4
     # p / m 用于阈值那几行 "1200 ppm"，开头空格也是必需字形
-    glyphs: [" -0123456789.:%°Cpm"]
+    # f / s 只为临时帧率显示
+    glyphs: [" -0123456789.:%°Cpmfs"]
 
 # ---------------- 界面 ----------------
 
@@ -781,6 +782,15 @@ lvgl:
             align: BOTTOM_RIGHT
             x: -28
             y: -24
+
+        # ---- 帧率（临时调试，底部正中，删掉这段即可恢复）----
+        - label:
+            id: fps_label
+            text: "-- fps"
+            text_font: num24
+            text_color: 0x46565F
+            align: BOTTOM_MID
+            y: -30
 
     # ==================================================================
     # 第 2 页：趋势
@@ -1630,6 +1640,26 @@ interval:
           static bool bars_ready = false;
           static float hist[16] = {0};
           tick++;
+
+          // ---- 帧率（临时调试，删掉这段和 fps_label 即可恢复）----
+          // LVGL 每真正画完一帧触发一次 RENDER_READY，比数 loop 次数准
+          static uint32_t fps_frames = 0;
+          static uint32_t fps_last = 0;
+          static bool fps_hooked = false;
+          if (!fps_hooked) {
+            fps_hooked = true;
+            lv_display_add_event_cb(lv_display_get_default(),
+                                    +[](lv_event_t *) { fps_frames++; },
+                                    LV_EVENT_RENDER_READY, nullptr);
+          }
+          uint32_t fps_now = millis();
+          if (fps_last && fps_now > fps_last) {
+            uint32_t f = fps_frames;
+            fps_frames = 0;
+            lv_label_set_text_fmt(id(fps_label), "%u fps",
+                                  (unsigned)(f * 1000 / (fps_now - fps_last)));
+          }
+          fps_last = fps_now;
 
           // ---- 四级分级（边界：<800 清新 / 800~1000 尚可 /
           //      1000~2000 通风 / >2000 头蒙），圆环、徽标、柱子共用 ----
