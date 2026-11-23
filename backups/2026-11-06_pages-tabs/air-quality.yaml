@@ -1,0 +1,878 @@
+# ESP32-S3-Touch-LCD-1.69 (Waveshare) 空气质量监测 —— ESPHome 版本
+# 与 ../src 下的 PlatformIO/Arduino 版本功能等价，二者可分别烧录
+#
+# 硬件：
+#   LCD   ST7789V 240x280 SPI  DC=4 CS=5 CLK=6 MOSI=7 RST=8 BL=15
+#   Touch CST816T I2C 0x15     SCL=10 SDA=11 RST=13 INT=14
+#   Sensor SCD41  I2C 0x62     （接在扩展口，与触摸共用 I2C 总线）
+#   MCU   ESP32-S3R8  16MB Flash / 8MB OPI PSRAM
+#
+# 界面：3 页，左右滑动切换
+#   1. 仪表页：CO2 圆环 + 温湿度
+#   2. 趋势页：最近 8 小时，每 30 分钟一根柱（16 根）
+#   3. 设置页：背光亮度、SCD41 基线校准
+#
+# 交互：拿起或触摸点亮背光，无动作 30 秒自动熄屏
+
+esphome:
+  name: air-quality
+  friendly_name: Air Quality Monitor
+  on_boot:
+    priority: -100
+    then:
+      # 蜂鸣器使能拉低
+      - output.turn_off: buzzer_en
+      # 去掉拖动的起始死区（默认 10px），手指一动页面就跟上
+      - lambda: |-
+          for (lv_indev_t *i = lv_indev_get_next(nullptr); i != nullptr; i = lv_indev_get_next(i)) {
+            lv_indev_set_scroll_limit(i, 3);
+          }
+      # 开机点亮，交给熄屏脚本统一管计时
+      - script.execute: screen_wake
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  # 240MHz：LVGL 渲染是纯 CPU 活，160MHz 下整屏重绘明显掉帧
+  cpu_frequency: 240MHz
+  framework:
+    type: arduino
+    version: 3.3.12
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+  # 板载 USB 是 USB-Serial-JTAG，不走 UART0
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "AirQuality Fallback"
+    password: "airquality"
+
+captive_portal:
+
+# ---------------- 巴法云 MQTT ----------------
+# 巴法云：client_id / username / password 都填私钥
+# topic_prefix 置空 + discovery 关闭，避免 ESPHome 自动发布到未建主题
+mqtt:
+  broker: mqtt.bemfa.com
+  port: 9501
+  username: !secret bemfa_key
+  password: !secret bemfa_key
+  client_id: !secret bemfa_key
+  topic_prefix: "airquality"
+  discovery: false
+  keepalive: 60s
+
+globals:
+  - id: g_co2
+    type: float
+  - id: g_temp
+    type: float
+  - id: g_hum
+    type: float
+  # 当前背光亮度，熄屏后重新点亮时恢复到这个值
+  - id: g_bri
+    type: float
+    initial_value: '0.10'
+  # 最后一次触摸/运动的时间戳，用于统一计算熄屏超时
+  - id: g_active_ms
+    type: uint32_t
+    initial_value: '0'
+  # 熄屏前 3 秒是否已经做过渐暗，避免重复触发
+  - id: g_dimmed
+    type: bool
+    initial_value: 'false'
+
+# ---------------- 总线 ----------------
+
+spi:
+  clk_pin: GPIO6
+  mosi_pin: GPIO7
+
+i2c:
+  sda: GPIO11
+  scl: GPIO10
+  frequency: 400kHz
+  scan: true
+
+# ---------------- 背光 ----------------
+
+output:
+  - platform: ledc
+    pin: GPIO15
+    id: bkl_pwm
+    frequency: 2000Hz
+
+  # 蜂鸣器使能脚，必须保持低电平，否则无源蜂鸣器持续耗电
+  - platform: gpio
+    pin: GPIO42
+    id: buzzer_en
+
+light:
+  - platform: monochromatic
+    output: bkl_pwm
+    id: backlight
+    name: "Backlight"
+    restore_mode: ALWAYS_ON
+    # 关掉 gamma，让 brightness 百分比线性对应 PWM 占空比
+    gamma_correct: 1.0
+
+# ---------------- 亮屏 / 熄屏 ----------------
+# 拿起（moving 置真）或触摸都调这个脚本：点亮背光，然后每秒检查一次，
+# 只要"还在动"或"距上次活动不足 30 秒"就继续亮，否则熄屏。
+# mode: restart —— 任何新活动都会打断当前等待并重新开始计时。
+
+script:
+  - id: screen_wake
+    mode: restart
+    then:
+      - lambda: id(g_dimmed) = false;
+      - light.turn_on:
+          id: backlight
+          brightness: !lambda "return id(g_bri);"
+      - while:
+          condition:
+            or:
+              - binary_sensor.is_on: motion_moving
+              - lambda: "return (millis() - id(g_active_ms)) < 30000;"
+          then:
+            # 熄屏前 3 秒开始渐暗，给一个"要黑了"的预告
+            - if:
+                condition:
+                  lambda: |-
+                    return !id(g_dimmed) && !id(motion_moving).state &&
+                           (millis() - id(g_active_ms)) >= 27000;
+                then:
+                  - lambda: id(g_dimmed) = true;
+                  - light.turn_on:
+                      id: backlight
+                      brightness: 15%
+                      transition_length: 2500ms
+            - delay: 500ms
+      - light.turn_off: backlight
+
+# ---------------- 显示 ----------------
+
+display:
+  - platform: mipi_spi
+    id: lcd
+    model: ST7789V
+    cs_pin: GPIO5
+    dc_pin: GPIO4
+    reset_pin: GPIO8
+    dimensions:
+      width: 240
+      height: 280
+      offset_height: 20
+    invert_colors: true
+    color_order: BGR
+    # 40MHz 时滑动一帧要传 4 次缓冲，明显掉帧；提到 80MHz 后传输耗时减半
+    data_rate: 80MHz
+    auto_clear_enabled: false
+    update_interval: never
+
+# ---------------- 触摸 ----------------
+
+touchscreen:
+  - platform: cst816
+    id: touch
+    address: 0x15
+    interrupt_pin: GPIO14
+    reset_pin: GPIO13
+    # 息屏后碰一下也能点亮；亮着时只续期，不重复调用 turn_on
+    on_touch:
+      - lambda: id(g_active_ms) = millis();
+      - if:
+          condition:
+            light.is_off: backlight
+          then:
+            - script.execute: screen_wake
+
+# ---------------- 加速度计：拿起亮屏 ----------------
+# QMI8658 挂在同一条 I2C 上（0x6B）。motion 平台的 moving 传感器在检测到
+# 加速度/角速度突变时置 true，之后持续 duration 无变化再置 false。
+# 这里只用它判断"是否还在动"，熄屏计时交给 screen_wake 脚本。
+
+motion:
+  - platform: qmi8658
+    id: imu
+    address: 0x6B
+    # 运动检测需要高频采样，官方建议 ≤100ms
+    update_interval: 100ms
+
+binary_sensor:
+  - platform: motion
+    motion_id: imu
+    type: moving
+    id: motion_moving
+    internal: true
+    # moving 判据：相邻采样加速度差 > threshold，或角速度差 > threshold×50。
+    # 取 1.0 → 加速度 1.0g / 角速度 50°/s。
+    # 实测：静置 <0.035g、环境干扰 w≈16°/s、敲桌子几乎无转动、
+    # 拿起时角速度可到 137°/s，所以 50°/s 能把敲桌子和拿起分开。
+    threshold: 1.0
+    duration: 30s
+    on_press:
+      - lambda: id(g_active_ms) = millis();
+      - script.execute: screen_wake
+
+# ---------------- 传感器 ----------------
+
+sensor:
+  - platform: scd4x
+    id: scd41
+    co2:
+      name: "CO2"
+      id: co2_sensor
+    temperature:
+      name: "Temperature"
+      id: temp_sensor
+    humidity:
+      name: "Humidity"
+      id: hum_sensor
+    automatic_self_calibration: true
+    temperature_offset: 4°C
+    update_interval: 5s
+
+# ---------------- 中文字体 ----------------
+# 思源黑体（SIL OFL），只打包用到的字符，两个字号
+font:
+  - file: "C:/Windows/Fonts/SourceHanSansSC-Medium.ttf"
+    id: cn16
+    size: 16
+    bpp: 4
+    glyphs:
+      - "空气质量优良一般偏高污染浓度趋势现在小时设置亮基线校准请先室外环境模拟等待仪表pm"
+      - "0123456789-"
+
+  - file: "C:/Windows/Fonts/SourceHanSansSC-Medium.ttf"
+    id: cn12
+    size: 12
+    bpp: 4
+    glyphs:
+      - "空气质量优良一般偏高污染浓度趋势现在小时设置亮基线校准请先室外环境模拟等待仪表pm"
+      - "0123456789-"
+
+# ---------------- 界面 ----------------
+
+lvgl:
+  displays:
+    - lcd
+  touchscreens:
+    - touch
+  color_depth: 16
+  buffer_size: 25%
+  log_level: WARN
+  bg_color: 0x0A0A0B
+  bg_opa: COVER
+
+  pages:
+    - id: page_main
+      bg_color: 0x0A0A0B
+      bg_opa: COVER
+      scrollable: false
+      widgets:
+        # ---- 顶部分段控件：点页签切页（每段热区 50x32）----
+        - obj:
+            width: 100
+            height: 32
+            radius: 16
+            bg_color: 0x1C1C1E
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            align: TOP_LEFT
+            x: 16
+            y: 10
+            widgets:
+              - obj:
+                  width: 50
+                  height: 32
+                  radius: 16
+                  bg_color: 0x2E2E32
+                  bg_opa: COVER
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  align: LEFT_MID
+                  on_click:
+                    - lambda: id(g_active_ms) = millis();
+                  widgets:
+                    - label:
+                        text: "仪表"
+                        text_font: cn12
+                        text_color: 0xF5F5F7
+                        align: CENTER
+              - obj:
+                  width: 50
+                  height: 32
+                  radius: 16
+                  bg_color: 0x1C1C1E
+                  bg_opa: COVER
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  align: RIGHT_MID
+                  on_click:
+                    - lambda: id(g_active_ms) = millis();
+                    - lvgl.page.show:
+                        id: page_trend
+                        animation: MOVE_LEFT
+                        time: 200ms
+                  widgets:
+                    - label:
+                        text: "趋势"
+                        text_font: cn12
+                        text_color: 0x808085
+                        align: CENTER
+        - label:
+            id: sim_badge
+            text: "模拟"
+            text_font: cn12
+            text_color: 0xFF9F0A
+            align: TOP_RIGHT
+            x: -54
+            y: 16
+
+        # 设置入口：右上角圆角方块 + 三条横线（不依赖字形，避免字体缺符号）
+        - obj:
+            id: btn_settings
+            width: 30
+            height: 30
+            radius: 15
+            bg_color: 0x1C1C1E
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            align: TOP_RIGHT
+            x: -14
+            y: 8
+            on_click:
+              - lambda: id(g_active_ms) = millis();
+              - lvgl.widget.show: settings_overlay
+            widgets:
+              - obj: {width: 12, height: 2, radius: 1, bg_color: 0xB0B0B5, bg_opa: COVER, border_width: 0, pad_all: 0, align: CENTER, y: -4}
+              - obj: {width: 12, height: 2, radius: 1, bg_color: 0xB0B0B5, bg_opa: COVER, border_width: 0, pad_all: 0, align: CENTER, y: 0}
+              - obj: {width: 12, height: 2, radius: 1, bg_color: 0xB0B0B5, bg_opa: COVER, border_width: 0, pad_all: 0, align: CENTER, y: 4}
+
+        # 圆环，圆心在 y=140
+        - arc:
+            id: co2_arc
+            width: 160
+            height: 160
+            align: TOP_MID
+            y: 60
+            min_value: 400
+            max_value: 2200
+            value: 400
+            start_angle: 135
+            end_angle: 45
+            adjustable: false
+            arc_width: 10
+            arc_color: 0x1C1C1E
+            arc_rounded: true
+            indicator:
+              arc_width: 10
+              arc_color: 0x30D158
+              arc_rounded: true
+
+        - label:
+            id: co2_label
+            text: "--"
+            text_font: montserrat_48
+            text_color: 0xF5F5F7
+            width: 160
+            text_align: CENTER
+            align: TOP_MID
+            y: 112
+
+        - label:
+            text: "ppm"
+            text_font: montserrat_12
+            text_color: 0x808085
+            text_letter_space: 2
+            width: 160
+            text_align: CENTER
+            align: TOP_MID
+            y: 168
+
+        - obj:
+            id: status_pill
+            width: 92
+            height: 22
+            radius: 11
+            bg_color: 0x30D158
+            bg_opa: 25%
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            align: TOP_MID
+            y: 226
+            widgets:
+              - label:
+                  id: status_label
+                  text: "等待"
+                  text_font: cn16
+                  text_color: 0x30D158
+                  align: CENTER
+
+        - label:
+            id: temp_label
+            text: "--.-°C"
+            text_font: montserrat_14
+            text_color: 0xB0B0B5
+            align: BOTTOM_LEFT
+            x: 16
+            y: -10
+
+        - label:
+            id: hum_label
+            text: "--.-%"
+            text_font: montserrat_14
+            text_color: 0xB0B0B5
+            align: BOTTOM_RIGHT
+            x: -16
+            y: -10
+
+        # ---- 设置覆盖层：点右上角按钮升起，点遮罩区域关闭 ----
+        # panel 设 clickable，吃掉面板内的点击，只有点面板外的遮罩才关闭。
+        - obj:
+            id: settings_overlay
+            width: 100%
+            height: 100%
+            bg_color: 0x000000
+            bg_opa: 60%
+            border_width: 0
+            radius: 0
+            pad_all: 0
+            scrollable: false
+            hidden: true
+            on_click:
+              - lambda: id(g_active_ms) = millis();
+              - lvgl.widget.hide: settings_overlay
+            widgets:
+              - obj:
+                  id: settings_panel
+                  width: 100%
+                  height: 204
+                  bg_color: 0x141416
+                  bg_opa: COVER
+                  border_width: 0
+                  radius: 16
+                  pad_all: 0
+                  scrollable: false
+                  clickable: true
+                  align: BOTTOM_MID
+                  widgets:
+                    - label:
+                        text: "设置"
+                        text_font: cn16
+                        text_color: 0xF5F5F7
+                        align: TOP_LEFT
+                        x: 16
+                        y: 12
+
+                    - obj:
+                        width: 208
+                        height: 1
+                        bg_color: 0x26262A
+                        bg_opa: COVER
+                        border_width: 0
+                        radius: 0
+                        pad_all: 0
+                        align: TOP_MID
+                        y: 40
+
+                    - label:
+                        text: "亮度"
+                        text_font: cn12
+                        text_color: 0xB0B0B5
+                        align: TOP_LEFT
+                        x: 16
+                        y: 54
+
+                    - label:
+                        id: bri_value
+                        text: "10%"
+                        text_font: montserrat_12
+                        text_color: 0xF5F5F7
+                        align: TOP_RIGHT
+                        x: -16
+                        y: 52
+
+                    - slider:
+                        id: bri_slider
+                        width: 208
+                        height: 12
+                        align: TOP_MID
+                        y: 76
+                        min_value: 5
+                        max_value: 100
+                        value: 10
+                        bg_color: 0x2A2A2E
+                        bg_opa: COVER
+                        border_width: 0
+                        radius: 6
+                        pad_all: 0
+                        indicator:
+                          bg_color: 0x30D158
+                          bg_opa: COVER
+                          radius: 6
+                        knob:
+                          bg_color: 0xF5F5F7
+                          bg_opa: COVER
+                          radius: 14
+                          pad_all: 9
+                        on_change:
+                          - lambda: |-
+                              float v = lv_slider_get_value(id(bri_slider));
+                              id(g_bri) = v / 100.0f;
+                              auto call = id(backlight).make_call();
+                              call.set_brightness(id(g_bri));
+                              call.perform();
+                              char buf[8];
+                              snprintf(buf, sizeof(buf), "%.0f%%", v);
+                              lv_label_set_text(id(bri_value), buf);
+
+                    - obj:
+                        width: 208
+                        height: 1
+                        bg_color: 0x26262A
+                        bg_opa: COVER
+                        border_width: 0
+                        radius: 0
+                        pad_all: 0
+                        align: TOP_MID
+                        y: 108
+
+                    - label:
+                        text: "基线校准"
+                        text_font: cn12
+                        text_color: 0xB0B0B5
+                        align: TOP_LEFT
+                        x: 16
+                        y: 120
+
+                    - label:
+                        text: "请先在室外400ppm环境"
+                        text_font: cn12
+                        text_color: 0x808085
+                        align: TOP_LEFT
+                        x: 16
+                        y: 138
+
+                    - button:
+                        id: btn_cal
+                        width: 208
+                        height: 40
+                        align: TOP_MID
+                        y: 158
+                        bg_color: 0x1C1C1E
+                        bg_opa: COVER
+                        border_width: 0
+                        radius: 10
+                        text: "校准400ppm"
+                        text_font: cn16
+                        text_color: 0xFF9F0A
+                        on_click:
+                          - scd4x.perform_forced_calibration:
+                              id: scd41
+                              value: 400
+
+
+    - id: page_trend
+      bg_color: 0x0A0A0B
+      bg_opa: COVER
+      scrollable: false
+      widgets:
+        # ---- 顶部分段控件：点页签切页（每段热区 50x32）----
+        - obj:
+            width: 100
+            height: 32
+            radius: 16
+            bg_color: 0x1C1C1E
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            align: TOP_LEFT
+            x: 16
+            y: 10
+            widgets:
+              - obj:
+                  width: 50
+                  height: 32
+                  radius: 16
+                  bg_color: 0x1C1C1E
+                  bg_opa: COVER
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  align: LEFT_MID
+                  on_click:
+                    - lambda: id(g_active_ms) = millis();
+                    - lvgl.page.show:
+                        id: page_main
+                        animation: MOVE_RIGHT
+                        time: 200ms
+                  widgets:
+                    - label:
+                        text: "仪表"
+                        text_font: cn12
+                        text_color: 0x808085
+                        align: CENTER
+              - obj:
+                  width: 50
+                  height: 32
+                  radius: 16
+                  bg_color: 0x2E2E32
+                  bg_opa: COVER
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  align: RIGHT_MID
+                  on_click:
+                    - lambda: id(g_active_ms) = millis();
+                  widgets:
+                    - label:
+                        text: "趋势"
+                        text_font: cn12
+                        text_color: 0xF5F5F7
+                        align: CENTER
+        - label:
+            text: "8小时"
+            text_font: cn12
+            text_color: 0x808085
+            align: TOP_RIGHT
+            x: -16
+            y: 18
+
+        # 柱状图区：16 根柱，每根 8px，间距 5px
+        - obj:
+            width: 208
+            height: 120
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            align: TOP_MID
+            y: 54
+            widgets:
+              - obj: {id: bar0,  width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 2,   y: 0}
+              - obj: {id: bar1,  width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 15,  y: 0}
+              - obj: {id: bar2,  width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 28,  y: 0}
+              - obj: {id: bar3,  width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 41,  y: 0}
+              - obj: {id: bar4,  width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 54,  y: 0}
+              - obj: {id: bar5,  width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 67,  y: 0}
+              - obj: {id: bar6,  width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 80,  y: 0}
+              - obj: {id: bar7,  width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 93,  y: 0}
+              - obj: {id: bar8,  width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 106, y: 0}
+              - obj: {id: bar9,  width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 119, y: 0}
+              - obj: {id: bar10, width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 132, y: 0}
+              - obj: {id: bar11, width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 145, y: 0}
+              - obj: {id: bar12, width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 158, y: 0}
+              - obj: {id: bar13, width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 171, y: 0}
+              - obj: {id: bar14, width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 184, y: 0}
+              - obj: {id: bar15, width: 8, height: 4, radius: 2, bg_color: 0x30D158, bg_opa: COVER, border_width: 0, pad_all: 0, align: BOTTOM_LEFT, x: 197, y: 0}
+
+        # 基线
+        - obj:
+            width: 208
+            height: 1
+            bg_color: 0x1C1C1E
+            bg_opa: COVER
+            border_width: 0
+            radius: 0
+            pad_all: 0
+            align: TOP_MID
+            y: 174
+
+        # 当前值
+        - label:
+            text: "现在"
+            text_font: cn12
+            text_color: 0xB0B0B5
+            align: TOP_LEFT
+            x: 16
+            y: 188
+
+        - label:
+            id: trend_value
+            text: "--"
+            text_font: montserrat_28
+            text_color: 0xF5F5F7
+            align: TOP_RIGHT
+            x: -46
+            y: 180
+
+        - label:
+            text: "ppm"
+            text_font: montserrat_12
+            text_color: 0x808085
+            align: TOP_RIGHT
+            x: -16
+            y: 196
+
+        - obj:
+            width: 208
+            height: 1
+            bg_color: 0x1C1C1E
+            bg_opa: COVER
+            border_width: 0
+            radius: 0
+            pad_all: 0
+            align: TOP_MID
+            y: 228
+
+        - label:
+            text: "-8小时"
+            text_font: cn12
+            text_color: 0x808085
+            align: TOP_LEFT
+            x: 16
+            y: 238
+
+        - label:
+            text: "现在"
+            text_font: cn12
+            text_color: 0x808085
+            align: TOP_RIGHT
+            x: -16
+            y: 238
+
+# ---------------- 数据刷新 ----------------
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          static uint32_t tick = 0;
+          static bool bars_ready = false;
+          tick++;
+
+          bool sim = !id(co2_sensor).has_state();
+          float co2, temp, hum;
+
+          if (sim) {
+            float t = millis() / 1000.0f;
+            co2  = 640.0f + 180.0f * sinf(t / 24.0f) + 25.0f * sinf(t / 3.1f);
+            temp = 24.5f + 0.6f * sinf(t / 40.0f);
+            hum  = 48.0f + 3.0f * sinf(t / 55.0f);
+          } else {
+            co2  = id(co2_sensor).state;
+            temp = id(temp_sensor).state;
+            hum  = id(hum_sensor).state;
+          }
+
+          lv_color_t c;
+          const char *level;
+          if (co2 < 800) {
+            c = lv_color_hex(0x30D158); level = "优良";
+          } else if (co2 < 1200) {
+            c = lv_color_hex(0xFFD60A); level = "一般";
+          } else if (co2 < 2000) {
+            c = lv_color_hex(0xFF9F0A); level = "偏高";
+          } else {
+            c = lv_color_hex(0xFF453A); level = "污染";
+          }
+
+          // ---- 仪表页 ----
+          char buf[16];
+          snprintf(buf, sizeof(buf), "%.0f", co2);
+          lv_label_set_text(id(co2_label), buf);
+          lv_arc_set_value(id(co2_arc), (int16_t)co2);
+          lv_obj_set_style_arc_color(id(co2_arc), c, LV_PART_INDICATOR);
+
+          lv_label_set_text(id(status_label), level);
+          lv_obj_set_style_text_color(id(status_label), c, 0);
+          lv_obj_set_style_bg_color(id(status_pill), c, 0);
+
+          snprintf(buf, sizeof(buf), "%.1f°C", temp);
+          lv_label_set_text(id(temp_label), buf);
+          snprintf(buf, sizeof(buf), "%.1f%%", hum);
+          lv_label_set_text(id(hum_label), buf);
+
+          if (sim) {
+            lv_obj_clear_flag(id(sim_badge), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(sim_badge), LV_OBJ_FLAG_HIDDEN);
+          }
+
+          // ---- 趋势页 ----
+          lv_obj_t *bars[16] = {
+            id(bar0),  id(bar1),  id(bar2),  id(bar3),
+            id(bar4),  id(bar5),  id(bar6),  id(bar7),
+            id(bar8),  id(bar9),  id(bar10), id(bar11),
+            id(bar12), id(bar13), id(bar14), id(bar15)
+          };
+
+          int h = (int)((co2 - 400.0f) * 120.0f / 1800.0f);
+          if (h < 4)   h = 4;
+          if (h > 120) h = 120;
+
+          if (!bars_ready) {
+            // 首帧用当前值铺平，避免一开机是空的
+            for (int i = 0; i < 16; i++) {
+              lv_obj_set_height(bars[i], h);
+              lv_obj_set_style_bg_color(bars[i], c, 0);
+            }
+            bars_ready = true;
+          } else {
+            // 模拟模式 30s 一根，真实数据 30min 一根
+            uint32_t period = sim ? 30 : 1800;
+            if (tick % period == 0) {
+              for (int i = 0; i < 15; i++) {
+                lv_obj_set_height(bars[i], lv_obj_get_height(bars[i + 1]));
+              }
+              lv_obj_set_height(bars[15], h);
+            }
+            for (int i = 0; i < 16; i++) {
+              lv_obj_set_style_bg_color(bars[i], c, 0);
+            }
+          }
+
+          snprintf(buf, sizeof(buf), "%.0f", co2);
+          lv_label_set_text(id(trend_value), buf);
+
+          // 缓存最新值，供 MQTT 发布
+          id(g_co2)  = co2;
+          id(g_temp) = temp;
+          id(g_hum)  = hum;
+
+  # 每分钟往巴法云三个主题各推一条
+  - interval: 60s
+    then:
+      - mqtt.publish:
+          topic: esp32co2004
+          payload: !lambda |-
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.0f", id(g_co2));
+            return std::string(buf);
+
+      - mqtt.publish:
+          topic: esp32temp004
+          payload: !lambda |-
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.1f", id(g_temp));
+            return std::string(buf);
+
+      - mqtt.publish:
+          topic: esp32hum004
+          payload: !lambda |-
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.1f", id(g_hum));
+            return std::string(buf);

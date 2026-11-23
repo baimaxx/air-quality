@@ -1,0 +1,29 @@
+qmi8658 组件补丁（针对 ESPHome 2026.10.2）
+==========================================
+
+原文件位置：
+  D:\Program Files\venvs\esphome\Lib\site-packages\esphome\components\qmi8658\__init__.py
+
+改动内容：
+  DEPENDENCIES = ["i2c", "motion"]   ->   DEPENDENCIES = ["i2c"]
+
+原因：
+  上游误把平台组件 motion 写进 DEPENDENCIES，而 motion 是平台组件、
+  没有顶层配置项，所以这条依赖永远无法满足，校验必然报：
+    Component qmi8658 requires component motion
+
+  同目录的 bmi270 / lsm6ds 都没有写这条。
+
+恢复方法：
+  把 qmi8658__init__.py 覆盖回上面的原文件位置；
+  或者只手工改 DEPENDENCIES 那一行。
+
+注意：
+  升级 / 重装 ESPHome 后此补丁会丢失，需要重打。
+  重打后若配置校验通过，说明补丁生效。
+
+配套配置写法：
+  qmi8658 是 motion 的子平台，YAML 里必须写成：
+    motion:
+      - platform: qmi8658
+  不能写成顶层 qmi8658:
