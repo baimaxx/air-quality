@@ -4,3 +4,7 @@
 # 任何层级的 secrets 文件。注意 backups/ 里的历史副本也含真实密码，
 # 用无斜杠的写法才能匹配到子目录
 secrets.yaml
+
+# Python 字节码缓存（external_components 加载时自动生成）
+__pycache__/
+*.pyc
