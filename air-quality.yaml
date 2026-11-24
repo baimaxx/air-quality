@@ -22,36 +22,37 @@ esphome:
   name: air-quality
   friendly_name: Air Quality Monitor
   on_boot:
-    # 黑匣子：最早执行（priority 800），把本次复位原因追加进历史。
-    # 此时所有组件的 setup() 已完成，globals 的值已从 NVS 读回。
-    # 条目格式 "复位原因/上次运行秒数"，逗号分隔，最多保留 20 条。
-    # 上次运行秒数来自 g_uptime_mark 的心跳（每 5 分钟写一次 NVS），
-    # 所以精度是 ±5 分钟；如果条目里是 0，说明上次运行不足 5 分钟就复位了。
-    - priority: 800
-      then:
-        - lambda: |-
-            const int reason = (int) esp_reset_reason();
-            const uint32_t last_up = id(g_uptime_mark);
-            std::string h = id(g_boot_log);
-            char ent[24];
-            snprintf(ent, sizeof(ent), "%d/%u", reason, (unsigned) last_up);
-            if (!h.empty()) h += ",";
-            h += ent;
-            // 只保留最近 20 条，超出从头部截掉
-            int n = 1;
-            for (char c : h) if (c == ',') n++;
-            while (n > 20) {
-              size_t p = h.find(',');
-              if (p == std::string::npos) break;
-              h.erase(0, p + 1);
-              n--;
-            }
-            id(g_boot_log) = h;
-            id(g_uptime_mark) = 0;
-            ESP_LOGI("blackbox", "reset_reason=%d last_uptime=%us hist=%s", reason, (unsigned) last_up, h.c_str());
-    # 原来的开机流程：点亮屏幕、同步设置、触发首次测量
-    - priority: -100
-      then:
+    # 注意：这里必须是 -100，不能提到 800。
+    # globals 组件的 setup 优先级是 29，从 NVS 读回旧值就发生在 setup 里。
+    # 如果在它之前（priority 800）改 g_boot_log / g_uptime_mark，
+    # 随后 globals 的 setup 会把改过的值当成"已保存值"记进 last_checked_value_，
+    # 于是 update() 永远判定"没变化"，一条都不会落盘。
+    priority: -100
+    then:
+      # ---- 黑匣子：把本次复位原因追加进历史 ----
+      # 条目格式 "复位原因/上次运行秒数"，逗号分隔，最多保留 20 条。
+      # 上次运行秒数来自 g_uptime_mark 的心跳（每 5 分钟写一次 NVS），
+      # 精度 ±5 分钟；条目里是 0 说明上次运行不足 5 分钟就复位了。
+      - lambda: |-
+          const int reason = (int) esp_reset_reason();
+          const uint32_t last_up = id(g_uptime_mark);
+          std::string h = id(g_boot_log);
+          char ent[24];
+          snprintf(ent, sizeof(ent), "%d/%u", reason, (unsigned) last_up);
+          if (!h.empty()) h += ",";
+          h += ent;
+          // 只保留最近 20 条，超出从头部截掉
+          int n = 1;
+          for (char c : h) if (c == ',') n++;
+          while (n > 20) {
+            size_t p = h.find(',');
+            if (p == std::string::npos) break;
+            h.erase(0, p + 1);
+            n--;
+          }
+          id(g_boot_log) = h;
+          id(g_uptime_mark) = 0;
+          ESP_LOGI("blackbox", "reset_reason=%d last_uptime=%us hist=%s", reason, (unsigned) last_up, h.c_str());
       # 本次复位原因：1 上电 / 3 软件重启 / 4 崩溃 / 6 任务看门狗 / 9 供电掉压
       - lambda: |-
           const char *r = "UNKNOWN";
@@ -196,10 +197,12 @@ globals:
   - id: g_co2
     type: float
   # 黑匣子：复位历史，"复位原因/上次运行秒数" 逗号分隔，最多 20 条。
-  # 在 on_boot priority 800 里追加，通过 MQTT 保留主题 esp32boot 对外发布。
+  # 默认容量只有 64 字节（含 1 字节长度前缀），20 条会写到一半就静默丢弃，
+  # 所以必须显式放大。254 是 schema 允许的最大值（实际分配 255 字节）。
   - id: g_boot_log
     type: std::string
     restore_value: true
+    max_restore_data_length: 254
     initial_value: '""'
   # 心跳：每 5 分钟把当前运行秒数写进 NVS，重启后据此推算上次跑了多久
   - id: g_uptime_mark
