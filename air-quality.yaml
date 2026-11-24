@@ -665,6 +665,8 @@ lvgl:
                     - lambda: id(g_active_ms) = millis();
                     - lvgl.page.show:
                         id: page_trend
+                    # 立刻重绘，不等 16ms 的刷新定时器（实测省 5~8ms）
+                    - lambda: lv_refr_now(NULL);
                   widgets:
                     - label:
                         text: "趋势"
@@ -847,6 +849,8 @@ lvgl:
                     - lambda: id(g_active_ms) = millis();
                     - lvgl.page.show:
                         id: page_main
+                    # 立刻重绘，不等 16ms 的刷新定时器（实测省 5~8ms）
+                    - lambda: lv_refr_now(NULL);
                   widgets:
                     - label:
                         text: "仪表"
