@@ -1706,7 +1706,9 @@ interval:
   # 5 分钟一次，重启后 g_uptime_mark 的值就是上次跑到的大致时刻。
   - interval: 5min
     then:
-      - lambda: id(g_uptime_mark) = (uint32_t) (millis() / 1000);
+      - lambda: |-
+          id(g_uptime_mark) = (uint32_t) (millis() / 1000);
+          ESP_LOGI("blackbox", "heartbeat uptime=%us hist=%s", (unsigned) id(g_uptime_mark), id(g_boot_log).c_str());
   - interval: 1s
     then:
       - lambda: |-
