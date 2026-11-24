@@ -22,8 +22,36 @@ esphome:
   name: air-quality
   friendly_name: Air Quality Monitor
   on_boot:
-    priority: -100
-    then:
+    # 黑匣子：最早执行（priority 800），把本次复位原因追加进历史。
+    # 此时所有组件的 setup() 已完成，globals 的值已从 NVS 读回。
+    # 条目格式 "复位原因/上次运行秒数"，逗号分隔，最多保留 20 条。
+    # 上次运行秒数来自 g_uptime_mark 的心跳（每 5 分钟写一次 NVS），
+    # 所以精度是 ±5 分钟；如果条目里是 0，说明上次运行不足 5 分钟就复位了。
+    - priority: 800
+      then:
+        - lambda: |-
+            const int reason = (int) esp_reset_reason();
+            const uint32_t last_up = id(g_uptime_mark);
+            std::string h = id(g_boot_log);
+            char ent[24];
+            snprintf(ent, sizeof(ent), "%d/%u", reason, (unsigned) last_up);
+            if (!h.empty()) h += ",";
+            h += ent;
+            // 只保留最近 20 条，超出从头部截掉
+            int n = 1;
+            for (char c : h) if (c == ',') n++;
+            while (n > 20) {
+              size_t p = h.find(',');
+              if (p == std::string::npos) break;
+              h.erase(0, p + 1);
+              n--;
+            }
+            id(g_boot_log) = h;
+            id(g_uptime_mark) = 0;
+            ESP_LOGI("blackbox", "reset_reason=%d last_uptime=%us hist=%s", reason, (unsigned) last_up, h.c_str());
+    # 原来的开机流程：点亮屏幕、同步设置、触发首次测量
+    - priority: -100
+      then:
       # 本次复位原因：1 上电 / 3 软件重启 / 4 崩溃 / 6 任务看门狗 / 9 供电掉压
       - lambda: |-
           const char *r = "UNKNOWN";
@@ -158,10 +186,26 @@ mqtt:
           snprintf(buf, sizeof(buf), "%d", (int)esp_reset_reason());
           return std::string(buf);
         retain: true
+    # 黑匣子全量历史，连上就推一次（保留消息，随时能读）
+    - mqtt.publish:
+        topic: esp32boot
+        payload: !lambda 'return id(g_boot_log);'
+        retain: true
 
 globals:
   - id: g_co2
     type: float
+  # 黑匣子：复位历史，"复位原因/上次运行秒数" 逗号分隔，最多 20 条。
+  # 在 on_boot priority 800 里追加，通过 MQTT 保留主题 esp32boot 对外发布。
+  - id: g_boot_log
+    type: std::string
+    restore_value: true
+    initial_value: '""'
+  # 心跳：每 5 分钟把当前运行秒数写进 NVS，重启后据此推算上次跑了多久
+  - id: g_uptime_mark
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
   - id: g_temp
     type: float
   - id: g_hum
@@ -1655,6 +1699,11 @@ lvgl:
 # ---------------- 数据刷新 ----------------
 
 interval:
+  # 黑匣子心跳：把运行秒数写进 NVS（值变化时 globals 自动落盘）。
+  # 5 分钟一次，重启后 g_uptime_mark 的值就是上次跑到的大致时刻。
+  - interval: 5min
+    then:
+      - lambda: id(g_uptime_mark) = (uint32_t) (millis() / 1000);
   - interval: 1s
     then:
       - lambda: |-
@@ -1987,6 +2036,11 @@ interval:
             char buf[8];
             snprintf(buf, sizeof(buf), "%d", (int)esp_reset_reason());
             return std::string(buf);
+          retain: true
+      # 黑匣子全量历史，同样 retain，重连后随时能读到
+      - mqtt.publish:
+          topic: esp32boot
+          payload: !lambda 'return id(g_boot_log);'
           retain: true
       - if:
           condition:
