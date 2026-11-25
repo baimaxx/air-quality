@@ -597,6 +597,23 @@ sensor:
     # 每 60 秒触发一次测量（测量本身约 5 秒，读数在轮询后第 5 秒才出）
     update_interval: 60s
 
+  # 电池电压：板载 200k/100k 分压 1/3 接到 GPIO4（ADC1_CH3，不受 WiFi 影响）
+  # 系数取自微雪官方 demo BAT_Driver.cpp：×3.0，0.992857 是它的校准偏移
+  - platform: adc
+    pin: GPIO4
+    id: bat_v
+    name: "Battery Voltage"
+    attenuation: 12db
+    update_interval: 60s
+    filters:
+      - multiply: 3.0216       # 1/3 分压 × 官方 0.992857 校准
+    # 每分钟一行，用来看分压系数对不对（万用表量电池端电压对一下）
+    on_value:
+      - logger.log:
+          level: INFO
+          format: "bat %.2fV"
+          args: ["x"]
+
 # ---------------- 字体 ----------------
 # 思源黑体（SIL OFL），只打包用到的字符。
 # 2.8 寸 480x640 下按 1.69 寸版本的 1.75 倍左右取字号。
@@ -644,7 +661,7 @@ font:
     bpp: 4
     # p / m 用于阈值那几行 "1200 ppm"，开头空格也是必需字形
     # f / s 只为临时帧率显示
-    glyphs: [" -0123456789.:%°Cpmfs"]
+    glyphs: [" -0123456789.:%°CpmfsV"]
 
 # ---------------- 界面 ----------------
 
@@ -735,6 +752,16 @@ lvgl:
             align: TOP_RIGHT
             x: -110
             y: 30
+
+        # ---- 电量（时钟下方，设置按钮正下方一列）----
+        - label:
+            id: bat_label
+            text: "--"
+            text_font: num24
+            text_color: 0x9AA9B1
+            align: TOP_RIGHT
+            x: -24
+            y: 86
 
         # ---- 设置入口 64x64 ----
         - obj:
@@ -937,6 +964,16 @@ lvgl:
             align: TOP_RIGHT
             x: -110
             y: 30
+
+        # ---- 电量（与仪表页同位置）----
+        - label:
+            id: bat_label2
+            text: "--"
+            text_font: num24
+            text_color: 0x9AA9B1
+            align: TOP_RIGHT
+            x: -24
+            y: 86
 
         # ---- 设置入口（趋势页也要能进）----
         - obj:
@@ -1863,6 +1900,32 @@ interval:
             }
           }
 
+          // ---- 电量采样 + 低电保护 ----
+          // 必须放在熄屏早退之前：界面熄屏时不用刷新，但过放保护得一直跑
+          static int last_bat = -1, last_bat_mv = -1;
+          int bat = -1, bat_mv = -1;
+          if (id(bat_v).has_state()) {
+            float v = id(bat_v).state;
+            float p = (v - 3.30f) / 0.90f * 100.0f;
+            if (p > 100.0f) p = 100.0f;
+            if (p < 0.0f) p = 0.0f;
+            bat = (int)(p + 0.5f);
+            bat_mv = (int)(v * 100.0f + 0.5f);
+          }
+          static bool lowbat = false;
+          if (bat_mv >= 0) {
+            if (!lowbat && bat_mv < 315) {
+              lowbat = true;
+              ESP_LOGW("bat", "低电 %d mV，熄屏降频", bat_mv);
+              id(backlight).turn_off().perform();
+              if (!id(g_asleep)) setCpuFrequencyMhz(80);
+            } else if (lowbat && bat_mv > 335) {
+              lowbat = false;
+              ESP_LOGI("bat", "电量恢复 %d mV", bat_mv);
+              if (!id(g_asleep)) setCpuFrequencyMhz(240);
+            }
+          }
+
           // 熄屏期间到此为止：只维护数据缓存和趋势历史，一个 LVGL 调用都不做。
           // 否则每秒都会 invalidate 一次，LVGL 白白重绘 + 往 PSRAM 搬 614KB。
           if (id(g_asleep)) return;
@@ -1899,6 +1962,24 @@ interval:
               lv_label_set_text(id(axis_start), "--:--");
             }
             last_min = cur_min;
+          }
+
+          // ---- 电量标签：只在变化时动界面 ----
+          // 换算和低电保护在上面（熄屏早退之前）已经算完，这里只负责画
+          if (bat != last_bat || bat_mv != last_bat_mv) {
+            last_bat = bat;
+            last_bat_mv = bat_mv;
+            char bb[20];
+            if (bat < 0) snprintf(bb, sizeof(bb), "--");
+            else snprintf(bb, sizeof(bb), "%d%% %.2fV", bat, bat_mv / 100.0f);
+            lv_label_set_text(id(bat_label), bb);
+            lv_label_set_text(id(bat_label2), bb);
+            uint32_t bc = bat < 0     ? 0x78848A   // 没读数
+                        : bat <= 10   ? 0xE5534B   // 红
+                        : bat <= 20   ? 0xE5B957   // 黄
+                                      : 0x9AA9B1;
+            lv_obj_set_style_text_color(id(bat_label), lv_color_hex(bc), 0);
+            lv_obj_set_style_text_color(id(bat_label2), lv_color_hex(bc), 0);
           }
 
           // ---- 只在数值真的变了才动界面 ----
