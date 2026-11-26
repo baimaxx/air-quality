@@ -92,6 +92,8 @@ esphome:
       #  提前触发会撞上正在进行的测量被 NACK）
       - delay: 8s
       - component.update: scd41
+      # 有界重试：每 60 秒算一次尝试，5 次都失败才关射频（见 wifi_retry）
+      - script.execute: wifi_retry
 
 # 本地覆盖的 st7701s 组件。相对内置版改了三处：
 #   1. loop() 不再每轮 restart，避免周期性打断 RGB DMA 导致画面上下跳动
@@ -132,6 +134,7 @@ ota:
   - platform: esphome
 
 wifi:
+  id: wifi_comp
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   # 省电大头：射频在两次 AP beacon 之间休眠。默认 NONE 时 WiFi 一直满功率待机，
@@ -166,6 +169,7 @@ time:
 # 巴法云：client_id / username / password 都填私钥
 # topic_prefix 置空 + discovery 关闭，避免 ESPHome 自动发布到未建主题
 mqtt:
+  id: mqtt_client
   broker: mqtt.bemfa.com
   port: 9501
   username: !secret bemfa_key
@@ -209,6 +213,10 @@ globals:
     restore_value: true
     max_restore_data_length: 254
     initial_value: '""'
+  # WiFi 上电重试计数（见 wifi_retry，最多 5 次）
+  - id: g_wifi_try
+    type: uint8_t
+    initial_value: '0'
   # 心跳：每 5 分钟把当前运行秒数写进 NVS，重启后据此推算上次跑了多久
   - id: g_uptime_mark
     type: uint32_t
@@ -381,6 +389,38 @@ script:
                 setCpuFrequencyMhz(80);
                 id(lcd)->update_pclk_frequency(6000000);
             - lvgl.pause:
+
+  # 上电连 WiFi：每 60 秒算一次尝试，最多 5 次（共约 5 分钟）。
+  # 期间 ESPHome 自己每 ~10 秒重试一次，这里只负责"什么时候放弃"。
+  # 放弃时把射频和 MQTT 都关掉：电池供电下无限重连要白烧 20~40mA，日志也刷屏。
+  # 想再试就断电重插。两个数字（60s / 5 次）就是这里的旋钮。
+  - id: wifi_retry
+    mode: single
+    then:
+      - lambda: id(g_wifi_try) = 0;
+      - while:
+          condition:
+            lambda: "return !id(wifi_comp)->is_connected() && id(g_wifi_try) < 5;"
+          then:
+            - delay: 60s
+            - if:
+                condition:
+                  lambda: "return !id(wifi_comp)->is_connected();"
+                then:
+                  - lambda: |-
+                      id(g_wifi_try)++;
+                      ESP_LOGW("wifi_retry", "第 %u/5 次未连上", (unsigned) id(g_wifi_try));
+      - if:
+          condition:
+            lambda: "return !id(wifi_comp)->is_connected();"
+          then:
+            - logger.log:
+                level: WARN
+                format: "5 次都未连上，关闭射频和 MQTT，不再重试"
+            - lambda: |-
+                // 先关 MQTT：它有自己的重连定时器，射频关了它还会每 10 秒试解析域名
+                id(mqtt_client)->disable();
+                id(wifi_comp)->disable();
 
   # 把持久化的设置同步到界面控件（开机 + 每次修改后调用）
   - id: sync_settings_ui
