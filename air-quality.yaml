@@ -29,12 +29,23 @@ esphome:
     # 于是 update() 永远判定"没变化"，一条都不会落盘。
     priority: -100
     then:
+      # ---- 唤醒原因：定时醒来只上报，人触摸才点屏 ----
+      - lambda: |-
+          #include <esp_sleep.h>
+          esp_sleep_wakeup_cause_t c = esp_sleep_get_wakeup_cause();
+          id(g_touch_wake) = (c == ESP_SLEEP_WAKEUP_EXT1 || c == ESP_SLEEP_WAKEUP_EXT0 ||
+                              c == ESP_SLEEP_WAKEUP_GPIO || c == ESP_SLEEP_WAKEUP_TOUCHPAD);
+          id(g_wake_n)++;  // 跨深睡累计，耗电曲线的横轴
+          ESP_LOGI("boot", "wake_cause=%d touch=%d wake_n=%u", (int) c,
+                   (int) id(g_touch_wake), (unsigned) id(g_wake_n));
       # ---- 黑匣子：把本次复位原因追加进历史 ----
       # 条目格式 "复位原因/上次运行秒数"，逗号分隔，最多保留 20 条。
       # 上次运行秒数来自 g_uptime_mark 的心跳（每 5 分钟写一次 NVS），
       # 精度 ±5 分钟；条目里是 0 说明上次运行不足 5 分钟就复位了。
       - lambda: |-
           const int reason = (int) esp_reset_reason();
+          // 深睡唤醒不是异常复位，一天 144 次会把 20 条历史冲干净，跳过
+          if (reason == ESP_RST_DEEPSLEEP) return;
           const uint32_t last_up = id(g_uptime_mark);
           std::string h = id(g_boot_log);
           char ent[24];
@@ -84,21 +95,31 @@ esphome:
           }
       # 把持久化的亮度 / 息屏时长 / 阈值同步到界面
       - script.execute: sync_settings_ui
-      # 开机点亮，交给熄屏脚本统一管计时
-      - script.execute: screen_wake
+      # 只有人触摸唤醒才点屏；定时唤醒只上报，屏幕全程不亮
+      - if:
+          condition:
+            lambda: "return id(g_touch_wake);"
+          then:
+            - script.execute: screen_wake
       # 单次测量模式下，第一次读数本来要等 60 秒的轮询。
       # 这里开机后主动触发一次测量，让第一屏真实数据在 13 秒左右出来
       # （8 秒等待：setup() 结束时已经自动发起过一次测量，约 2~7 秒，
       #  提前触发会撞上正在进行的测量被 NACK）
-      - delay: 8s
       # 上次记录下来的耗电曲线。放在 8 秒后：太靠前会跟开机横幅一起滚过去，
       # 人（和串口监视器）都还没接上就没了。空的时候也打一行，好确认记录器是活的。
       - lambda: |-
           ESP_LOGI("batlog", "耗电曲线 %u 字节（分钟:0.01V）: %s",
                    (unsigned) id(g_bat_log).size(), id(g_bat_log).c_str());
-      - component.update: scd41
-      # 有界重试：每 60 秒算一次尝试，5 次都失败才关射频（见 wifi_retry）
-      - script.execute: wifi_retry
+      - if:
+          condition:
+            lambda: "return id(g_touch_wake);"
+          then:
+            # 人要看：等 8 秒让 setup() 那次测量出值，再补一次，第一屏就有真实数据
+            - delay: 8s
+            - component.update: scd41
+          else:
+            # 定时唤醒：只上报，不碰屏幕，报完立刻睡（见 report_now）
+            - script.execute: report_now
 
 # 本地覆盖的 st7701s 组件。相对内置版改了三处：
 #   1. loop() 不再每轮 restart，避免周期性打断 RGB DMA 导致画面上下跳动
@@ -137,6 +158,19 @@ api:
 
 ota:
   - platform: esphome
+
+# 省电：定时醒来上报一次，其余时间深睡；屏幕只在人触摸时点亮。
+# 深睡 = 复位，RAM 全丢，所以醒来是完整重启（约 1.5 秒）。
+deep_sleep:
+  id: ds
+  run_duration: 45s          # 兜底：任何路径卡住，45 秒后强制睡
+  sleep_duration: 10min
+  # GT911 触摸 INT。同一个脚触摸屏组件也在用，必须显式允许复用
+  wakeup_pin:
+    - pin:
+        number: GPIO16
+        allow_other_uses: true
+  wakeup_pin_mode: KEEP_AWAKE  # 手指还按着就别睡（否则会立刻被唤醒，空转）
 
 wifi:
   id: wifi_comp
@@ -206,6 +240,12 @@ mqtt:
         topic: esp32boot
         payload: !lambda 'return id(g_boot_log);'
         retain: true
+    # 耗电曲线也推一份：深睡设备每次醒来只活 10 秒，抓串口很难，
+    # 走 retained 消息就能随时远程读到最新的曲线
+    - mqtt.publish:
+        topic: esp32bat
+        payload: !lambda 'return id(g_bat_log);'
+        retain: true
 
 globals:
   - id: g_co2
@@ -227,9 +267,14 @@ globals:
     restore_value: yes
     max_restore_data_length: 254
     initial_value: '""'
-  # WiFi 上电重试计数（见 wifi_retry，最多 5 次）
-  - id: g_wifi_try
-    type: uint8_t
+  # 本次是被触摸唤醒(g_touch_wake=1)还是定时唤醒(0)：决定要不要点屏
+  - id: g_touch_wake
+    type: bool
+    initial_value: 'false'
+  # 唤醒次数，跨深睡累计。耗电曲线的横轴 = 次数 × 10 分钟
+  - id: g_wake_n
+    type: uint32_t
+    restore_value: yes
     initial_value: '0'
   # 心跳：每 5 分钟把当前运行秒数写进 NVS，重启后据此推算上次跑了多久
   - id: g_uptime_mark
@@ -347,6 +392,8 @@ script:
   - id: screen_wake
     mode: restart
     then:
+      # 有人在看：取消 run_duration 的兜底计时，睡不睡由熄屏流程决定
+      - deep_sleep.prevent: ds
       - lambda: id(g_dimmed) = false;
       # 只在真正从熄屏状态唤醒时才恢复主频并继续渲染。
       # 亮屏期间每次触摸/运动都会 restart 本脚本，若无条件 resume，
@@ -403,38 +450,55 @@ script:
                 setCpuFrequencyMhz(80);
                 id(lcd)->update_pclk_frequency(6000000);
             - lvgl.pause:
+            # 熄屏 = 该睡了。面板必须先 sleep-in：深睡时 MCU 停了，但面板
+            # 只要还有电就会继续吃 6~10mA，这一条不解决整个省电方案就白做。
+            - lambda: id(lcd)->panel_sleep_in();
+            - deep_sleep.enter:
+                id: ds
 
-  # 上电连 WiFi：每 60 秒算一次尝试，最多 5 次（共约 5 分钟）。
-  # 期间 ESPHome 自己每 ~10 秒重试一次，这里只负责"什么时候放弃"。
-  # 放弃时把射频和 MQTT 都关掉：电池供电下无限重连要白烧 20~40mA，日志也刷屏。
-  # 想再试就断电重插。两个数字（60s / 5 次）就是这里的旋钮。
-  - id: wifi_retry
+  # 定时唤醒的完整流程：等传感器出值 → 等 MQTT 连上 → 发一条 → 面板睡 → 深睡。
+  # 醒着的总时长要压在 10 秒内：多 5 秒，一天就多烧 0.7mAh × 144 次。
+  - id: report_now
     mode: single
     then:
-      - lambda: id(g_wifi_try) = 0;
-      - while:
+      # setup() 结束时已经自动发起过一次测量，约 5 秒出值；WiFi 也是同时连的
+      - wait_until:
           condition:
-            lambda: "return !id(wifi_comp)->is_connected() && id(g_wifi_try) < 5;"
-          then:
-            - delay: 60s
-            - if:
-                condition:
-                  lambda: "return !id(wifi_comp)->is_connected();"
-                then:
-                  - lambda: |-
-                      id(g_wifi_try)++;
-                      ESP_LOGW("wifi_retry", "第 %u/5 次未连上", (unsigned) id(g_wifi_try));
+            lambda: "return id(co2_sensor).has_state();"
+          timeout: 9s
       - if:
           condition:
-            lambda: "return !id(wifi_comp)->is_connected();"
+            lambda: "return id(wifi_comp)->is_connected() && id(co2_sensor).has_state();"
           then:
+            - wait_until:
+                condition:
+                  lambda: "return id(mqtt_client)->is_connected();"
+                timeout: 8s
+            - if:
+                condition:
+                  lambda: "return id(mqtt_client)->is_connected();"
+                then:
+                  # on_connect 只发复位原因和黑匣子，传感器数据在这里单独发
+                  - mqtt.publish:
+                      topic: esp32air004
+                      payload: !lambda |-
+                        char buf[48];
+                        snprintf(buf, sizeof(buf), "#%.1f#%.1f#on###%.0f",
+                                 id(g_temp), id(g_hum), id(g_co2));
+                        return std::string(buf);
+                  # QoS0 是异步的，给 TCP 发送留时间再睡
+                  - delay: 800ms
+                else:
+                  - logger.log:
+                      level: WARN
+                      format: "MQTT 没连上，本轮跳过上报"
+          else:
             - logger.log:
                 level: WARN
-                format: "5 次都未连上，关闭射频和 MQTT，不再重试"
-            - lambda: |-
-                // 先关 MQTT：它有自己的重连定时器，射频关了它还会每 10 秒试解析域名
-                id(mqtt_client)->disable();
-                id(wifi_comp)->disable();
+                format: "WiFi 或传感器没就绪，本轮跳过上报"
+      - lambda: id(lcd)->panel_sleep_in();
+      - deep_sleep.enter:
+          id: ds
 
   # 把持久化的设置同步到界面控件（开机 + 每次修改后调用）
   - id: sync_settings_ui
@@ -575,7 +639,10 @@ touchscreen:
   - platform: gt911
     id: touch
     address: 0x5D
-    interrupt_pin: GPIO16
+    # 同一个脚给 deep_sleep 当唤醒源，两边都要标 allow_other_uses
+    interrupt_pin:
+      number: GPIO16
+      allow_other_uses: true
     reset_pin:
       pca9554: exio
       number: 1
@@ -1981,12 +2048,13 @@ interval:
             }
           }
 
-          // ---- 耗电日志：每 5 分钟一条，写进 NVS，重启时整段打印 ----
-          // 只用 tick（开机秒数）做时间轴：没有 RTC，重启后归零正好标出新的运行段
-          if (bat_mv >= 0 && tick % 900 == 0) {
+          // ---- 耗电日志：每次唤醒记一条，写进 NVS，重启时整段打印 ----
+          // 深睡会把 millis 清零，所以时间轴只能用跨深睡累计的 g_wake_n。
+          // 每格约 10 分钟（深睡 10min + 醒着 10s，实际 10.2 分钟，一天漂 2%）
+          if (bat_mv >= 0 && tick == 3) {
             char e[16];
             // 单位是 0.01V（4.12V -> 412），比毫伏少一个字符，254 字节能多存 3 条
-            snprintf(e, sizeof(e), "%u:%d;", (unsigned) (tick / 60), bat_mv);
+            snprintf(e, sizeof(e), "%u:%d;", (unsigned) (id(g_wake_n) * 10), bat_mv);
             std::string s = id(g_bat_log) + e;
             if (s.size() > 250) s = s.substr(s.find(';', s.size() - 250) + 1);
             id(g_bat_log) = s;

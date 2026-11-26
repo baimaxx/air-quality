@@ -125,6 +125,11 @@ void ST7701S::draw_pixel_at(int x, int y, Color color) {
   this->feed_wdt_per_pixel_();
 }
 
+void ST7701S::panel_sleep_in() {
+  this->write_command_(0x28);  // display off
+  this->write_command_(0x10);  // sleep in
+}
+
 void ST7701S::write_command_(uint8_t value) {
   this->enable();
   if (this->dc_pin_ == nullptr) {

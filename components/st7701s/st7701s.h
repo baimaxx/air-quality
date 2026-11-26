@@ -53,6 +53,9 @@ class ST7701S final : public display::Display,
   // 运行时改 PCLK，用于熄屏后降低面板扫描带宽（面板空转会持续读 PSRAM）。
   // 内部会重启 RGB DMA，调用瞬间画面可能中断，只在背光已关时调用。
   void update_pclk_frequency(uint32_t freq_hz);
+  // 面板进睡眠：先关显示再发 sleep-in(0x10)，内部 DC-DC 停机，
+  // 静态电流从 ~6-10mA 降到几十 uA。进深睡前必须调，否则面板一直在吃电。
+  void panel_sleep_in();
   void set_dimensions(uint16_t width, uint16_t height) {
     this->width_ = width;
     this->height_ = height;
