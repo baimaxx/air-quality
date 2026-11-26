@@ -165,12 +165,15 @@ deep_sleep:
   id: ds
   run_duration: 45s          # 兜底：任何路径卡住，45 秒后强制睡
   sleep_duration: 10min
-  # GT911 触摸 INT。同一个脚触摸屏组件也在用，必须显式允许复用
-  wakeup_pin:
-    - pin:
-        number: GPIO16
-        allow_other_uses: true
-  wakeup_pin_mode: KEEP_AWAKE  # 手指还按着就别睡（否则会立刻被唤醒，空转）
+  # 触摸唤醒走 esp32_ext1_wakeup（ANY_LOW），不用 wakeup_pin：
+  # 单脚 ext0 的代码路径里有 gpio_hold_en()，实测叫不醒，ext1 不碰 hold。
+  # GT911 的 INT 低有效：按下拉低、空闲为高，所以 ANY_LOW。
+  esp32_ext1_wakeup:
+    mode: ANY_LOW
+    pins:
+      - pin:
+          number: GPIO16
+          allow_other_uses: true
 
 wifi:
   id: wifi_comp

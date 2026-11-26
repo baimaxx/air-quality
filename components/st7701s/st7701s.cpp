@@ -126,8 +126,13 @@ void ST7701S::draw_pixel_at(int x, int y, Color color) {
 }
 
 void ST7701S::panel_sleep_in() {
+  // setup() 结尾调过 spi_teardown() 释放总线（初始化序列发完就不需要了），
+  // 所以这里必须重新 spi_setup()，否则 delegate 是 Dummy，
+  // 只会打印 "SPIDevice not initialised"，命令根本发不出去。
+  this->spi_setup();
   this->write_command_(0x28);  // display off
   this->write_command_(0x10);  // sleep in
+  this->spi_teardown();
 }
 
 void ST7701S::write_command_(uint8_t value) {
