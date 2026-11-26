@@ -91,6 +91,11 @@ esphome:
       # （8 秒等待：setup() 结束时已经自动发起过一次测量，约 2~7 秒，
       #  提前触发会撞上正在进行的测量被 NACK）
       - delay: 8s
+      # 上次记录下来的耗电曲线。放在 8 秒后：太靠前会跟开机横幅一起滚过去，
+      # 人（和串口监视器）都还没接上就没了。空的时候也打一行，好确认记录器是活的。
+      - lambda: |-
+          ESP_LOGI("batlog", "耗电曲线 %u 字节（分钟:0.01V）: %s",
+                   (unsigned) id(g_bat_log).size(), id(g_bat_log).c_str());
       - component.update: scd41
       # 有界重试：每 60 秒算一次尝试，5 次都失败才关射频（见 wifi_retry）
       - script.execute: wifi_retry
@@ -211,6 +216,15 @@ globals:
   - id: g_boot_log
     type: std::string
     restore_value: true
+    max_restore_data_length: 254
+    initial_value: '""'
+  # 耗电日志：每 15 分钟一条 "开机分钟:0.01V;"，存 NVS，重启时整段打印。
+  # ESPHome 的 string global 上限 254 字节（不是可选项，schema 写死），
+  # 一条约 9 字节 → 约 28 条 ≈ 7 小时，够看一整次放电。
+  # ponytail: 254 字节天花板；要看更长的曲线就自己用 nvs_flash 存 blob，不值得为它加这套东西
+  - id: g_bat_log
+    type: std::string
+    restore_value: yes
     max_restore_data_length: 254
     initial_value: '""'
   # WiFi 上电重试计数（见 wifi_retry，最多 5 次）
@@ -651,8 +665,9 @@ sensor:
     on_value:
       - logger.log:
           level: INFO
-          format: "bat %.2fV"
-          args: ["x"]
+          # asleep=1 屏幕在睡、wifi=1 已连上；两个都是 0 时最费电
+          format: "bat %.2fV asleep=%d wifi=%d"
+          args: ["x", "id(g_asleep)", "id(wifi_comp)->is_connected()"]
 
 # ---------------- 字体 ----------------
 # 思源黑体（SIL OFL），只打包用到的字符。
@@ -1956,14 +1971,25 @@ interval:
           if (bat_mv >= 0) {
             if (!lowbat && bat_mv < 315) {
               lowbat = true;
-              ESP_LOGW("bat", "低电 %d mV，熄屏降频", bat_mv);
+              ESP_LOGW("bat", "低电 %d mV，熄屏降频", bat_mv * 10);
               id(backlight).turn_off().perform();
               if (!id(g_asleep)) setCpuFrequencyMhz(80);
             } else if (lowbat && bat_mv > 335) {
               lowbat = false;
-              ESP_LOGI("bat", "电量恢复 %d mV", bat_mv);
+              ESP_LOGI("bat", "电量恢复 %d mV", bat_mv * 10);
               if (!id(g_asleep)) setCpuFrequencyMhz(240);
             }
+          }
+
+          // ---- 耗电日志：每 5 分钟一条，写进 NVS，重启时整段打印 ----
+          // 只用 tick（开机秒数）做时间轴：没有 RTC，重启后归零正好标出新的运行段
+          if (bat_mv >= 0 && tick % 900 == 0) {
+            char e[16];
+            // 单位是 0.01V（4.12V -> 412），比毫伏少一个字符，254 字节能多存 3 条
+            snprintf(e, sizeof(e), "%u:%d;", (unsigned) (tick / 60), bat_mv);
+            std::string s = id(g_bat_log) + e;
+            if (s.size() > 250) s = s.substr(s.find(';', s.size() - 250) + 1);
+            id(g_bat_log) = s;
           }
 
           // 熄屏期间到此为止：只维护数据缓存和趋势历史，一个 LVGL 调用都不做。
