@@ -3,10 +3,11 @@ import re
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
-SECRETS = "/mnt/e/code/zb/esp32-air-monitor/esphome/secrets.yaml"
+SECRETS = Path(__file__).resolve().parents[1] / "secrets.yaml"
 DURATION = int(sys.argv[1]) if len(sys.argv) > 1 else 90
 
 key = None
@@ -21,7 +22,7 @@ seen = []
 
 def on_connect(c, u, flags, rc):
     print(f"# connected rc={rc}", flush=True)
-    for t in ("esp32air004", "esp32bat", "esp32boot", "esp32reset", "airquality/#", "#"):
+    for t in ("esp32air004", "esp32boot", "esp32reset", "airquality/#"):
         c.subscribe(t)
 
 

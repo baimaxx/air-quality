@@ -133,6 +133,16 @@ void ST7701S::panel_sleep_in() {
   this->write_command_(0x28);  // display off
   this->write_command_(0x10);  // sleep in
   this->spi_teardown();
+  esph_log_i(TAG, "panel sleep in");
+}
+
+void ST7701S::panel_sleep_out() {
+  this->spi_setup();
+  this->write_command_(0x11);  // sleep out
+  delay(120);                  // 数据手册：SLEEP OUT 后至少 120ms 才能 DISPON
+  this->write_command_(0x29);  // display on
+  this->spi_teardown();
+  esph_log_i(TAG, "panel sleep out");
 }
 
 void ST7701S::write_command_(uint8_t value) {

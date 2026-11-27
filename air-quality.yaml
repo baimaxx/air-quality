@@ -100,10 +100,11 @@ esphome:
       # 有界重试：每 60 秒算一次尝试，5 次都失败才关射频（见 wifi_retry）
       - script.execute: wifi_retry
 
-# 本地覆盖的 st7701s 组件。相对内置版改了三处：
+# 本地覆盖的 st7701s 组件。相对内置版改了四处：
 #   1. loop() 不再每轮 restart，避免周期性打断 RGB DMA 导致画面上下跳动
 #   2. bounce buffer 20 行（内置 10 行），减少 PSRAM 读取的碎块
 #   3. 新增 update_pclk_frequency()，供熄屏时降低面板扫描频率
+#   4. 新增 panel_sleep_in/out()，熄屏时关掉面板内部电路，唤屏时叫醒
 # 放本地是为了升级 ESPHome 不被覆盖。
 external_components:
   - source:
@@ -280,6 +281,10 @@ globals:
   - id: g_ui_force
     type: bool
     initial_value: 'true'
+  # 低电保护已触发：点亮屏幕的脚本必须遵守，否则一触摸/拿起就会把屏又点亮
+  - id: g_lowbat
+    type: bool
+    initial_value: 'false'
   # 趋势历史：16 个 30 分钟格，逗号分隔存成字符串写进 NVS（断电重启接着画）
   # 空槽用 nan 表示，统计和柱子都会跳过
   - id: g_hist_str
@@ -333,7 +338,8 @@ light:
     output: bkl_pwm
     id: backlight
     name: "Backlight"
-    restore_mode: ALWAYS_ON
+    # 先灭着，等 on_boot 的 screen_wake 按保存的亮度点亮，避免上电白光闪一下
+    restore_mode: ALWAYS_OFF
     # 关掉 gamma，让 brightness 百分比线性对应 PWM 占空比
     gamma_correct: 1.0
 
@@ -348,6 +354,25 @@ script:
     mode: restart
     then:
       - lambda: id(g_dimmed) = false;
+      # 低电保护期间不再点亮：触摸/拿起只维持熄屏，避免低电时被反复点亮
+      - if:
+          condition:
+            lambda: "return id(g_lowbat);"
+          then:
+            - light.turn_off:
+                id: backlight
+            - if:
+                condition:
+                  lambda: "return !id(g_asleep);"
+                then:
+                  - delay: 600ms
+                  - lambda: |-
+                      id(g_asleep) = true;
+                      id(lcd)->panel_sleep_in();
+                      setCpuFrequencyMhz(80);
+                      id(lcd)->update_pclk_frequency(1500000);
+                  - lvgl.pause:
+            - script.stop: screen_wake
       # 只在真正从熄屏状态唤醒时才恢复主频并继续渲染。
       # 亮屏期间每次触摸/运动都会 restart 本脚本，若无条件 resume，
       # 每次触摸都会整屏 invalidate 重绘一遍，反而更费电。
@@ -358,9 +383,10 @@ script:
             - lambda: |-
                 id(g_asleep) = false;
                 id(g_ui_force) = true;
-                // 先把扫描频率和主频拉回来，再恢复渲染和背光，唤醒瞬间才不闪
+                // 先把扫描频率和主频拉回来，再叫醒面板、恢复渲染和背光，唤醒瞬间才不闪
                 id(lcd)->update_pclk_frequency(12000000);
                 setCpuFrequencyMhz(240);
+                id(lcd)->panel_sleep_out();
             - lvgl.resume:
       - light.turn_on:
           id: backlight
@@ -380,7 +406,7 @@ script:
                   - if:
                       condition:
                         lambda: |-
-                          return !id(g_dimmed) && !id(motion_moving).state &&
+                          return !id(g_lowbat) && !id(g_dimmed) && !id(motion_moving).state &&
                                  id(g_sleep_s) > 4 &&
                                  (millis() - id(g_active_ms)) >= ((uint32_t)id(g_sleep_s) - 3) * 1000UL;
                       then:
@@ -395,13 +421,15 @@ script:
                 transition_length: 500ms
             # 等背光真正黑掉再动面板，否则降频瞬间的重启会被看到
             - delay: 600ms
-            # 熄屏后的省电四连：CPU 240→80MHz、PCLK 12→6MHz、暂停 LVGL 渲染。
-            # 面板扫描是硬件行为停不掉，但 12MHz 时它每秒要从 PSRAM 读 17MB，
-            # 降到 6MHz 减半（8.6MB/s），这部分是熄屏后唯一的持续功耗。
+            # 熄屏后的省电五连：面板 sleep-in（停内部 DC-DC，省 6~10mA）、
+            # CPU 240→80MHz、PCLK 12→1.5MHz、暂停 LVGL 渲染。
+            # 面板扫描停不掉（扫描由 SoC 的 DMA 驱动），12MHz 时每秒要从
+            # PSRAM 读 17MB，降到 1.5MHz 只剩约 2.1MB/s。
             - lambda: |-
                 id(g_asleep) = true;
+                id(lcd)->panel_sleep_in();
                 setCpuFrequencyMhz(80);
-                id(lcd)->update_pclk_frequency(6000000);
+                id(lcd)->update_pclk_frequency(1500000);
             - lvgl.pause:
 
   # 上电连 WiFi：每 60 秒算一次尝试，最多 5 次（共约 5 分钟）。
@@ -476,13 +504,10 @@ script:
 display:
   - platform: st7701s
     id: lcd
-    # 初始化命令走 3 线 SPI，CS / RST 在 TCA9554 上
+    # 初始化命令走 3 线 SPI，CS 在 TCA9554 上（RST 未驱动，面板靠上电复位）
     cs_pin:
       pca9554: exio
       number: 2
-    reset_pin:
-      pca9554: exio
-      number: 0
     data_rate: 10MHz
     dimensions:
       width: 480
@@ -936,15 +961,6 @@ lvgl:
             align: BOTTOM_RIGHT
             x: -28
             y: -24
-
-        # ---- 帧率（临时调试，底部正中，删掉这段即可恢复）----
-        - label:
-            id: fps_label
-            text: "-- fps"
-            text_font: num24
-            text_color: 0x46565F
-            align: BOTTOM_MID
-            y: -30
 
     # ==================================================================
     # 第 2 页：趋势
@@ -1814,26 +1830,6 @@ interval:
           static float hist[16] = {0};
           tick++;
 
-          // ---- 帧率（临时调试，删掉这段和 fps_label 即可恢复）----
-          // LVGL 每真正画完一帧触发一次 RENDER_READY，比数 loop 次数准
-          static uint32_t fps_frames = 0;
-          static uint32_t fps_last = 0;
-          static bool fps_hooked = false;
-          if (!fps_hooked) {
-            fps_hooked = true;
-            lv_display_add_event_cb(lv_display_get_default(),
-                                    +[](lv_event_t *) { fps_frames++; },
-                                    LV_EVENT_RENDER_READY, nullptr);
-          }
-          uint32_t fps_now = millis();
-          if (fps_last && fps_now > fps_last) {
-            uint32_t f = fps_frames;
-            fps_frames = 0;
-            lv_label_set_text_fmt(id(fps_label), "%u fps",
-                                  (unsigned)(f * 1000 / (fps_now - fps_last)));
-          }
-          fps_last = fps_now;
-
           // ---- 四级分级（边界：<800 清新 / 800~1000 尚可 /
           //      1000~2000 通风 / >2000 头蒙），圆环、徽标、柱子共用 ----
           auto level_of = [](float v, lv_color_t *c, lv_color_t *bg,
@@ -1888,12 +1884,6 @@ interval:
               hist[idx++] = strtof(s.substr(pos, comma - pos).c_str(), nullptr);
               pos = comma + 1;
             }
-            bool any = false;
-            for (int i = 0; i < 16; i++)
-              if (!std::isnan(hist[i])) any = true;
-            // 全新设备没有历史：把当前值放进最新一格，别让图表空半小时。
-            // 但 sim 时当前值是正弦波演示值，不能拿它当第一格。
-            if (!any && !sim) hist[15] = co2;
           }
 
           // ---- 关机期间空掉的格子：等时间同步后补一次 ----
@@ -1912,6 +1902,21 @@ interval:
                   for (int i = 16 - gap; i < 16; i++) hist[i] = NAN;
                 }
               }
+            }
+          }
+
+          // 全新设备没有历史：等第一条真实读数到达再补最新一格。
+          // 不能放在上面的恢复块里——开机第一个 tick 传感器还没数据（sim），
+          // 补格会被跳过且再也不会重试，趋势图会空半小时。
+          static bool hist_seeded = false;
+          if (!hist_seeded && !sim) {
+            hist_seeded = true;
+            bool any = false;
+            for (int i = 0; i < 16; i++)
+              if (!std::isnan(hist[i])) any = true;
+            if (!any) {
+              hist[15] = co2;
+              id(g_ui_force) = true;
             }
           }
 
@@ -1967,21 +1972,26 @@ interval:
             bat = (int)(p + 0.5f);
             bat_mv = (int)(v * 100.0f + 0.5f);
           }
-          static bool lowbat = false;
           if (bat_mv >= 0) {
-            if (!lowbat && bat_mv < 315) {
-              lowbat = true;
+            if (!id(g_lowbat) && bat_mv < 315) {
+              id(g_lowbat) = true;
               ESP_LOGW("bat", "低电 %d mV，熄屏降频", bat_mv * 10);
               id(backlight).turn_off().perform();
-              if (!id(g_asleep)) setCpuFrequencyMhz(80);
-            } else if (lowbat && bat_mv > 335) {
-              lowbat = false;
+              if (!id(g_asleep)) {
+                setCpuFrequencyMhz(80);
+                id(lcd)->update_pclk_frequency(1500000);
+              }
+            } else if (id(g_lowbat) && bat_mv > 335) {
+              id(g_lowbat) = false;
               ESP_LOGI("bat", "电量恢复 %d mV", bat_mv * 10);
-              if (!id(g_asleep)) setCpuFrequencyMhz(240);
+              if (!id(g_asleep)) {
+                setCpuFrequencyMhz(240);
+                id(lcd)->update_pclk_frequency(12000000);
+              }
             }
           }
 
-          // ---- 耗电日志：每 5 分钟一条，写进 NVS，重启时整段打印 ----
+          // ---- 耗电日志：每 15 分钟一条，写进 NVS，重启时整段打印 ----
           // 只用 tick（开机秒数）做时间轴：没有 RTC，重启后归零正好标出新的运行段
           if (bat_mv >= 0 && tick % 900 == 0) {
             char e[16];
@@ -2101,11 +2111,7 @@ interval:
           snprintf(buf, sizeof(buf), "%.0f%%", hum);
           lv_label_set_text(id(hum_label), buf);
 
-          if (sim) {
-            lv_obj_clear_flag(id(sim_badge), LV_OBJ_FLAG_HIDDEN);
-          } else {
-            lv_obj_add_flag(id(sim_badge), LV_OBJ_FLAG_HIDDEN);
-          }
+          lv_obj_set_hidden(id(sim_badge), !sim);
 
           // ---- 趋势页 ----
           for (int i = 0; i < 16; i++) {
@@ -2183,22 +2189,10 @@ interval:
   #   #温度#湿度#开关状态#空气质量#pm2.5#二氧化碳浓度
   # 前面字段不能省，后面可以省，中间可以空但 # 不能少。
   # 注意：往 004 主题发裸数字（比如 "946"）巴法云解析不了，米家同步过去是空设备。
+  # 复位原因和黑匣子只在 mqtt on_connect 发一次（见上），这里不重复发，
+  # 每分钟只保留下面这一条真正变化的数据。
   - interval: 60s
     then:
-      # 每分钟刷一次复位原因。主题名故意不带 001~009 后缀，
-      # 避免被巴法云当成设备同步到米家（会显示成乱七八糟的温度）。
-      - mqtt.publish:
-          topic: esp32reset
-          payload: !lambda |-
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%d", (int)esp_reset_reason());
-            return std::string(buf);
-          retain: true
-      # 黑匣子全量历史，同样 retain，重连后随时能读到
-      - mqtt.publish:
-          topic: esp32boot
-          payload: !lambda 'return id(g_boot_log);'
-          retain: true
       - if:
           condition:
             lambda: 'return id(co2_sensor).has_state();'
@@ -2207,6 +2201,14 @@ interval:
                 topic: esp32air004
                 payload: !lambda |-
                   char buf[48];
-                  snprintf(buf, sizeof(buf), "#%.1f#%.1f#on###%.0f",
-                           id(g_temp), id(g_hum), id(g_co2));
+                  // 数据超时：开关位报 off，远端能看出传感器已失效，
+                  // 不会把最后一组旧值当新鲜数据一直读
+                  bool stale = id(g_last_ok_ms) != 0 &&
+                               (millis() - id(g_last_ok_ms)) > 180000UL;
+                  if (stale) {
+                    snprintf(buf, sizeof(buf), "#%.1f#%.1f#off", id(g_temp), id(g_hum));
+                  } else {
+                    snprintf(buf, sizeof(buf), "#%.1f#%.1f#on###%.0f",
+                             id(g_temp), id(g_hum), id(g_co2));
+                  }
                   return std::string(buf);
