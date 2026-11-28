@@ -96,6 +96,15 @@ esphome:
       - lambda: |-
           ESP_LOGI("batlog", "耗电曲线 %u 字节（分钟:0.01V）: %s",
                    (unsigned) id(g_bat_log).size(), id(g_bat_log).c_str());
+      - lambda: |-
+          ESP_LOGI("stallog", "stall log %u bytes: %s",
+                   (unsigned) id(g_stall_log).size(), id(g_stall_log).c_str());
+      - lambda: |-
+          ESP_LOGI("screenlog", "screen log %u bytes: %s",
+                   (unsigned) id(g_screen_log).size(), id(g_screen_log).c_str());
+      - lambda: |-
+          ESP_LOGI("wifilog", "wifi 累计断线 %u 次，离线 %u 分钟",
+                   (unsigned) id(g_wifi_drop_cnt), (unsigned) id(g_wifi_off_min));
       - component.update: scd41
       # 有界重试：每 60 秒算一次尝试，5 次都失败才关射频（见 wifi_retry）
       - script.execute: wifi_retry
@@ -148,6 +157,11 @@ wifi:
   power_save_mode: LIGHT
   # 开机跳过全信道扫描，直连已存 SSID，省掉几秒的搜网高功率
   fast_connect: true
+  # 每次掉线记一笔（含被 AP 拒绝后重连成功的情况），存 NVS
+  on_disconnect:
+    - lambda: |-
+        id(g_wifi_drop_cnt) = id(g_wifi_drop_cnt) + 1;
+        ESP_LOGW("wifilog", "wifi disconnected, total %u", (unsigned) id(g_wifi_drop_cnt));
   ap:
     ssid: "AirQuality Fallback"
     password: "airquality"
@@ -219,6 +233,24 @@ globals:
     restore_value: true
     max_restore_data_length: 254
     initial_value: '""'
+  # 亮/熄屏事件："L分钟来源; D分钟;"（来源 T=触摸 M=运动 ?=未知），存 NVS、开机打印。
+  # 用来核对"屏幕实际醒着多久"——熄屏功耗的大头是屏幕，亮得比预期多就是耗电元凶。
+  - id: g_screen_log
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 254
+    initial_value: '""'
+  # 本次点亮是谁触发的：0 未知 / 1 触摸 / 2 运动，供上面的记录使用
+  - id: g_wake_src
+    type: int
+    initial_value: '0'
+  # SCD41 掉线诊断：超时开始/恢复/只读探测结果，"S秒:电压:睡着; P秒:电压:Wxx:Rxx:X状态; R秒;"，
+  # 存 NVS，重启时整段打印（排查电池供电下偶发停更用）
+  - id: g_stall_log
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 254
+    initial_value: '""'
   # 耗电日志：每 15 分钟一条 "开机分钟:0.01V;"，存 NVS，重启时整段打印。
   # ESPHome 的 string global 上限 254 字节（不是可选项，schema 写死），
   # 一条约 9 字节 → 约 28 条 ≈ 7 小时，够看一整次放电。
@@ -231,6 +263,17 @@ globals:
   # WiFi 上电重试计数（见 wifi_retry，最多 5 次）
   - id: g_wifi_try
     type: uint8_t
+    initial_value: '0'
+  # WiFi 稳定性统计：累计断线次数 + 累计离线分钟（开机 2 分钟后才开始计，
+  # 避开启动握手）。重连是高功耗事件（~100mA × 数秒），夜里频繁掉线会明显
+  # 拉高平均电流；开机打印，看两次开机之间的差值即可判断这段运行稳不稳。
+  - id: g_wifi_drop_cnt
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: g_wifi_off_min
+    type: uint32_t
+    restore_value: yes
     initial_value: '0'
   # 心跳：每 5 分钟把当前运行秒数写进 NVS，重启后据此推算上次跑了多久
   - id: g_uptime_mark
@@ -305,6 +348,7 @@ spi:
   mosi_pin: GPIO1
 
 i2c:
+  id: i2c_bus
   sda: GPIO15
   scl: GPIO7
   # 传感器已焊接，回到标准 400kHz
@@ -371,6 +415,11 @@ script:
                       id(lcd)->panel_sleep_in();
                       setCpuFrequencyMhz(80);
                       id(lcd)->update_pclk_frequency(1500000);
+                      char e[12];
+                      snprintf(e, sizeof(e), "D%u;", (unsigned) (millis() / 60000));
+                      std::string s = id(g_screen_log) + e;
+                      if (s.size() > 250) s = s.substr(s.find(';', s.size() - 250) + 1);
+                      id(g_screen_log) = s;
                   - lvgl.pause:
             - script.stop: screen_wake
       # 只在真正从熄屏状态唤醒时才恢复主频并继续渲染。
@@ -387,6 +436,12 @@ script:
                 id(lcd)->update_pclk_frequency(12000000);
                 setCpuFrequencyMhz(240);
                 id(lcd)->panel_sleep_out();
+                char e[16];
+                snprintf(e, sizeof(e), "L%u%c;", (unsigned) (millis() / 60000),
+                         id(g_wake_src) == 1 ? 'T' : (id(g_wake_src) == 2 ? 'M' : '?'));
+                std::string s = id(g_screen_log) + e;
+                if (s.size() > 250) s = s.substr(s.find(';', s.size() - 250) + 1);
+                id(g_screen_log) = s;
             - lvgl.resume:
       - light.turn_on:
           id: backlight
@@ -430,6 +485,11 @@ script:
                 id(lcd)->panel_sleep_in();
                 setCpuFrequencyMhz(80);
                 id(lcd)->update_pclk_frequency(1500000);
+                char e[12];
+                snprintf(e, sizeof(e), "D%u;", (unsigned) (millis() / 60000));
+                std::string s = id(g_screen_log) + e;
+                if (s.size() > 250) s = s.substr(s.find(';', s.size() - 250) + 1);
+                id(g_screen_log) = s;
             - lvgl.pause:
 
   # 上电连 WiFi：每 60 秒算一次尝试，最多 5 次（共约 5 分钟）。
@@ -611,6 +671,7 @@ touchscreen:
           condition:
             light.is_off: backlight
           then:
+            - lambda: id(g_wake_src) = 1;
             - script.execute: screen_wake
 
 # ---------------- 加速度计：拿起亮屏 ----------------
@@ -639,6 +700,7 @@ binary_sensor:
     duration: 30s
     on_press:
       - lambda: id(g_active_ms) = millis();
+      - lambda: id(g_wake_src) = 2;
       - script.execute: screen_wake
 
 # ---------------- 传感器 ----------------
@@ -1966,9 +2028,23 @@ interval:
           int bat = -1, bat_mv = -1;
           if (id(bat_v).has_state()) {
             float v = id(bat_v).state;
-            float p = (v - 3.30f) / 0.90f * 100.0f;
-            if (p > 100.0f) p = 100.0f;
-            if (p < 0.0f) p = 0.0f;
+            // 电压→电量：小锂电典型放电曲线查表、段内线性插值。
+            // 3.9V 以下曲线很陡，原来的线性折算会明显高估剩余电量
+            // （3.7V 线性说 44%，实际只剩一成多）。
+            static const float ocv[] = {3.30f, 3.45f, 3.55f, 3.65f, 3.70f, 3.75f,
+                                        3.80f, 3.90f, 4.00f, 4.10f, 4.20f};
+            static const float pct[] = {0.0f, 2.0f, 5.0f, 10.0f, 17.0f, 27.0f,
+                                        38.0f, 58.0f, 74.0f, 88.0f, 100.0f};
+            float p;
+            if (v <= ocv[0]) {
+              p = 0.0f;
+            } else if (v >= ocv[10]) {
+              p = 100.0f;
+            } else {
+              int i = 0;
+              while (i < 9 && v > ocv[i + 1]) i++;
+              p = pct[i] + (pct[i + 1] - pct[i]) * (v - ocv[i]) / (ocv[i + 1] - ocv[i]);
+            }
             bat = (int)(p + 0.5f);
             bat_mv = (int)(v * 100.0f + 0.5f);
           }
@@ -2001,6 +2077,66 @@ interval:
             if (s.size() > 250) s = s.substr(s.find(';', s.size() - 250) + 1);
             id(g_bat_log) = s;
           }
+
+          // ---- SCD41 掉线诊断（只记录，不干预）----
+          // 超时开始/恢复各记一条；掉线期间每 5 分钟发一次只读查询
+          // GET_DATA_READY(0xE4B8)，记录 I2C 错误码和传感器返回的状态：
+          //   NACK          = 传感器不在总线上
+          //   ACK + 无数据  = 传感器在，但启动测量一直没成功
+          //   ACK + 有数据  = 传感器有数，是组件的读取路径失败
+          // 记录写入 NVS（g_stall_log），重启后开机打印，不依赖串口在场。
+          static uint32_t last_probe_ms = 0;
+          static bool silent_logged = false;
+          bool sensor_silent = !sim && id(g_last_ok_ms) != 0 &&
+                               millis() - id(g_last_ok_ms) > 180000UL;
+          auto stall_append = [](const char *ent) {
+            std::string s = id(g_stall_log) + ent;
+            if (s.size() > 250) s = s.substr(s.find(';', s.size() - 250) + 1);
+            id(g_stall_log) = s;
+          };
+          if (sensor_silent && !silent_logged) {
+            silent_logged = true;
+            uint32_t age_s = (millis() - id(g_last_ok_ms)) / 1000;
+            ESP_LOGW("co2diag", "stale start after %us (bat %dmV, asleep=%d)",
+                     (unsigned) age_s, bat_mv, (int) id(g_asleep));
+            char ent[32];
+            snprintf(ent, sizeof(ent), "S%u:%d:%d;", (unsigned) age_s, bat_mv, (int) id(g_asleep));
+            stall_append(ent);
+          } else if (!sensor_silent && silent_logged) {
+            silent_logged = false;
+            uint32_t age_s = (millis() - id(g_last_ok_ms)) / 1000;
+            ESP_LOGI("co2diag", "stale end, %.0fs", (double) age_s);
+            char ent[16];
+            snprintf(ent, sizeof(ent), "R%u;", (unsigned) age_s);
+            stall_append(ent);
+          }
+          if (sensor_silent &&
+              (last_probe_ms == 0 || millis() - last_probe_ms >= 300000UL)) {
+            last_probe_ms = millis();
+            auto sens_crc8 = [](const uint8_t *d, size_t n) {
+              uint8_t c = 0xFF;
+              for (size_t i = 0; i < n; i++) {
+                c ^= d[i];
+                for (int b = 0; b < 8; b++)
+                  c = (c & 0x80) ? (uint8_t) ((c << 1) ^ 0x31) : (uint8_t) (c << 1);
+              }
+              return c;
+            };
+            uint8_t cmd[3] = {0xE4, 0xB8, 0};
+            cmd[2] = sens_crc8(cmd, 2);
+            uint8_t rsp[3] = {0xFF, 0xFF, 0xFF};
+            auto werr = id(i2c_bus)->write(0x62, cmd, 3);
+            auto rerr = id(i2c_bus)->read(0x62, rsp, 3);
+            uint16_t raw = ((uint16_t) rsp[0] << 8) | rsp[1];
+            uint32_t age_s = (millis() - id(g_last_ok_ms)) / 1000;
+            ESP_LOGW("co2diag", "probe: write=%d read=%d status=0x%04X",
+                     (int) werr, (int) rerr, raw);
+            char ent[48];
+            snprintf(ent, sizeof(ent), "P%u:%d:W%d:R%d:X%04X;",
+                     (unsigned) age_s, bat_mv, (int) werr, (int) rerr, raw);
+            stall_append(ent);
+          }
+          if (!sensor_silent) last_probe_ms = 0;
 
           // 熄屏期间到此为止：只维护数据缓存和趋势历史，一个 LVGL 调用都不做。
           // 否则每秒都会 invalidate 一次，LVGL 白白重绘 + 往 PSRAM 搬 614KB。
@@ -2193,6 +2329,11 @@ interval:
   # 每分钟只保留下面这一条真正变化的数据。
   - interval: 60s
     then:
+      # 离线分钟统计：开机 2 分钟后，只要没连上就记一分钟
+      - lambda: |-
+          if (millis() > 120000UL && !id(wifi_comp)->is_connected()) {
+            id(g_wifi_off_min) = id(g_wifi_off_min) + 1;
+          }
       - if:
           condition:
             lambda: 'return id(co2_sensor).has_state();'
