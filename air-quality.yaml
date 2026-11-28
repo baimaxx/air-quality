@@ -94,8 +94,9 @@ esphome:
       # 上次记录下来的耗电曲线。放在 8 秒后：太靠前会跟开机横幅一起滚过去，
       # 人（和串口监视器）都还没接上就没了。空的时候也打一行，好确认记录器是活的。
       - lambda: |-
-          ESP_LOGI("batlog", "耗电曲线 %u 字节（分钟:0.01V）: %s",
-                   (unsigned) id(g_bat_log).size(), id(g_bat_log).c_str());
+          ESP_LOGI("batlog", "耗电曲线 %u+%u 字节（分钟:0.01V）: %s%s",
+                   (unsigned) id(g_bat_log_b).size(), (unsigned) id(g_bat_log).size(),
+                   id(g_bat_log_b).c_str(), id(g_bat_log).c_str());
       - lambda: |-
           ESP_LOGI("stallog", "stall log %u bytes: %s",
                    (unsigned) id(g_stall_log).size(), id(g_stall_log).c_str());
@@ -256,6 +257,12 @@ globals:
   # 一条约 9 字节 → 约 28 条 ≈ 7 小时，够看一整次放电。
   # ponytail: 254 字节天花板；要看更长的曲线就自己用 nvs_flash 存 blob，不值得为它加这套东西
   - id: g_bat_log
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 254
+    initial_value: '""'
+  # 耗电日志 B 段：A 段写满后整段挪过来，开机时 B+A 拼接打印，历史翻倍
+  - id: g_bat_log_b
     type: std::string
     restore_value: yes
     max_restore_data_length: 254
@@ -2071,10 +2078,15 @@ interval:
           // 只用 tick（开机秒数）做时间轴：没有 RTC，重启后归零正好标出新的运行段
           if (bat_mv >= 0 && tick % 900 == 0) {
             char e[16];
-            // 单位是 0.01V（4.12V -> 412），比毫伏少一个字符，254 字节能多存 3 条
+            // 单位是 0.01V（4.12V -> 412），比毫伏少一个字符
             snprintf(e, sizeof(e), "%u:%d;", (unsigned) (tick / 60), bat_mv);
             std::string s = id(g_bat_log) + e;
-            if (s.size() > 250) s = s.substr(s.find(';', s.size() - 250) + 1);
+            if (s.size() > 250) {
+              // 单条 global 上限 254 字节（schema 写死）：A 段写满后整段挪到 B，
+              // A 从空重新攒。开机打印 B+A，覆盖约 15.5 小时（2×~31 条）
+              id(g_bat_log_b) = id(g_bat_log);
+              s = e;
+            }
             id(g_bat_log) = s;
           }
 
@@ -2085,10 +2097,16 @@ interval:
           //   ACK + 无数据  = 传感器在，但启动测量一直没成功
           //   ACK + 有数据  = 传感器有数，是组件的读取路径失败
           // 记录写入 NVS（g_stall_log），重启后开机打印，不依赖串口在场。
+          // 条目格式：S=读到过但超时开始 / N=开机至今从未读到（虚焊等）/
+          //           R=恢复 / P=探测时 W 写错码、R 读错码、X 状态字
           static uint32_t last_probe_ms = 0;
           static bool silent_logged = false;
-          bool sensor_silent = !sim && id(g_last_ok_ms) != 0 &&
-                               millis() - id(g_last_ok_ms) > 180000UL;
+          static int last_werr = -1, last_rerr = -1, last_raw = -1;
+          // 盲区修复：从未读到过（g_last_ok_ms==0）也纳入诊断，以开机 3 分钟为界。
+          // 不能再看 sim——虚焊时 sim 一直为真，旧条件会把诊断整体屏蔽。
+          bool sensor_seen = id(g_last_ok_ms) != 0;
+          bool sensor_silent = sensor_seen ? (millis() - id(g_last_ok_ms) > 180000UL)
+                                           : (millis() > 180000UL);
           auto stall_append = [](const char *ent) {
             std::string s = id(g_stall_log) + ent;
             if (s.size() > 250) s = s.substr(s.find(';', s.size() - 250) + 1);
@@ -2096,15 +2114,21 @@ interval:
           };
           if (sensor_silent && !silent_logged) {
             silent_logged = true;
-            uint32_t age_s = (millis() - id(g_last_ok_ms)) / 1000;
-            ESP_LOGW("co2diag", "stale start after %us (bat %dmV, asleep=%d)",
-                     (unsigned) age_s, bat_mv, (int) id(g_asleep));
             char ent[32];
-            snprintf(ent, sizeof(ent), "S%u:%d:%d;", (unsigned) age_s, bat_mv, (int) id(g_asleep));
+            if (sensor_seen) {
+              uint32_t age_s = (millis() - id(g_last_ok_ms)) / 1000;
+              ESP_LOGW("co2diag", "stale start after %us (bat %dmV, asleep=%d)",
+                       (unsigned) age_s, bat_mv, (int) id(g_asleep));
+              snprintf(ent, sizeof(ent), "S%u:%d:%d;", (unsigned) age_s, bat_mv, (int) id(g_asleep));
+            } else {
+              ESP_LOGW("co2diag", "no reading since boot (bat %dmV, asleep=%d)",
+                       bat_mv, (int) id(g_asleep));
+              snprintf(ent, sizeof(ent), "N%d:%d;", bat_mv, (int) id(g_asleep));
+            }
             stall_append(ent);
           } else if (!sensor_silent && silent_logged) {
             silent_logged = false;
-            uint32_t age_s = (millis() - id(g_last_ok_ms)) / 1000;
+            uint32_t age_s = sensor_seen ? (millis() - id(g_last_ok_ms)) / 1000 : 0;
             ESP_LOGI("co2diag", "stale end, %.0fs", (double) age_s);
             char ent[16];
             snprintf(ent, sizeof(ent), "R%u;", (unsigned) age_s);
@@ -2134,9 +2158,18 @@ interval:
             char ent[48];
             snprintf(ent, sizeof(ent), "P%u:%d:W%d:R%d:X%04X;",
                      (unsigned) age_s, bat_mv, (int) werr, (int) rerr, raw);
-            stall_append(ent);
+            // 只在探测结果变化时落 NVS：持续 NACK 的传感器不会把 254 字节刷满，
+            // 日志里留下的是"状态发生切换"的时刻（接触不良的间歇特征靠这个抓）
+            bool changed = (int) werr != last_werr || (int) rerr != last_rerr || (int) raw != last_raw;
+            last_werr = (int) werr;
+            last_rerr = (int) rerr;
+            last_raw = (int) raw;
+            if (changed) stall_append(ent);
           }
-          if (!sensor_silent) last_probe_ms = 0;
+          if (!sensor_silent) {
+            last_probe_ms = 0;
+            last_werr = last_rerr = last_raw = -1;
+          }
 
           // 熄屏期间到此为止：只维护数据缓存和趋势历史，一个 LVGL 调用都不做。
           // 否则每秒都会 invalidate 一次，LVGL 白白重绘 + 往 PSRAM 搬 614KB。
